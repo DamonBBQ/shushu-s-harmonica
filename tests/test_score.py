@@ -41,12 +41,21 @@ class ScoreTests(unittest.TestCase):
         )
         self.assertEqual(score.length, 4.5)
 
+    def test_txt_grid_subdivides_notes_rests_and_extensions(self):
+        score = self.load_text('BPM=120\nGRID=4\n5- - | 0 - ^1--- 0\n')
+        self.assertEqual(
+            [(event.pitch, event.start, event.duration) for event in score.events],
+            [(67, 0.0, 0.375), (72, 0.625, 0.5)],
+        )
+        self.assertEqual(score.length, 1.25)
+
     def test_invalid_txt_reports_line_and_token(self):
         cases = (
             ('BPM=120\n1 9 2', r'第 2 行.*9'),
             ('BPM=120\n1 mistake 2', r'第 2 行.*mistake'),
             ('1\nBPM=inf', r'第 2 行.*BPM'),
             ('1\nBPM=nan', r'第 2 行.*BPM'),
+            ('1\nGRID=2.5', r'第 2 行.*GRID'),
             ('\n@format example/1\n1', r'第 2 行.*@format'),
             ('示例 — 三角洲口琴谱\n键位标记 + - #\n1', r'第 2 行.*键位文本谱'),
         )

@@ -108,6 +108,7 @@ def load_txt(path: str | Path) -> Score:
     text = path.read_text(encoding='utf-8-sig')
     title = path.stem
     bpm = 100
+    grid = 1
     body: list[tuple[int, str]] = []
 
     for line_number, raw in enumerate(text.splitlines(), 1):
@@ -126,6 +127,11 @@ def load_txt(path: str | Path) -> Score:
             if not isfinite(tempo_value):
                 raise ValueError(f'第 {line_number} 行的 BPM 必须是有限数字')
             bpm = round(max(20, min(300, tempo_value)))
+        elif equals and header == 'GRID':
+            try:
+                grid = max(1, min(16, int(value.strip())))
+            except ValueError as exc:
+                raise ValueError(f'第 {line_number} 行的 GRID 必须是整数') from exc
         elif re.match(r'@format(?:\s|=|$)', line, re.IGNORECASE):
             raise ValueError(f'第 {line_number} 行声明了暂不支持的 @format 曲谱，请导入 MIDI 或基本简谱 TXT')
         elif '键位标记' in line or re.match(r'小节\s+\d+\s*\(', line):
@@ -133,7 +139,7 @@ def load_txt(path: str | Path) -> Score:
         else:
             body.append((line_number, line))
 
-    beat = 60.0 / bpm
+    unit = 60.0 / bpm / grid
     cursor = 0.0
     events: list[ScoreEvent] = []
     last_event: ScoreEvent | None = None
@@ -143,7 +149,7 @@ def load_txt(path: str | Path) -> Score:
             if set(token) == {'-'}:
                 if cursor == 0:
                     raise ValueError(f'第 {line_number} 行的 {token!r} 前需要有音符或休止符')
-                extension = len(token) * beat
+                extension = len(token) * unit
                 if last_event is not None:
                     last_event.duration += extension
                 cursor += extension
@@ -153,18 +159,18 @@ def load_txt(path: str | Path) -> Score:
                 raise ValueError(f'第 {line_number} 行含有无法识别的记号 {token!r}')
             prefix, symbol, trailing = match.groups()
             prefix, symbol = prefix.lower(), symbol.lower()
-            beats = 1 + len(trailing)
+            duration = (1 + len(trailing)) * unit
             if symbol == '0':
-                cursor += beats * beat
+                cursor += duration
                 last_event = None
                 continue
             is_high_do = symbol in ('8', 'i')
             degree = 1 if is_high_do else int(symbol)
             octave = prefix.count('^') - prefix.count('b') + (1 if is_high_do else 0)
             pitch = 60 + octave * 12 + _NOTE_OFFSETS[degree - 1] + (1 if '#' in prefix else 0)
-            event = ScoreEvent(pitch=pitch, start=cursor, duration=beats * beat)
+            event = ScoreEvent(pitch=pitch, start=cursor, duration=duration)
             events.append(event)
-            cursor += beats * beat
+            cursor += duration
             last_event = event
 
     if not events:
