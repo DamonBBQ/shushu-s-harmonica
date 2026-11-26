@@ -270,13 +270,15 @@ class MainWindow(QMainWindow):
         self.list_scores.clear()
         if SCORES_DIR.is_dir():
             files = sorted(
-                (p for p in SCORES_DIR.iterdir()
-                 if p.suffix.lower() in ('.mid', '.midi', '.txt')),
-                key=lambda p: p.name.lower())
+                (p for p in SCORES_DIR.rglob('*')
+                 if p.is_file() and p.suffix.lower() in ('.mid', '.midi', '.txt')),
+                key=lambda p: (p.parent != SCORES_DIR, p.name.lower()))
             for path in files:
-                item = QListWidgetItem(path.stem)
+                rel = path.relative_to(SCORES_DIR)
+                label = path.stem if path.parent == SCORES_DIR else f'{path.parent.name}/{path.stem}'
+                item = QListWidgetItem(label)
                 item.setData(Qt.UserRole, str(path))
-                item.setToolTip(str(path))
+                item.setToolTip(str(rel))
                 self.list_scores.addItem(item)
         if self.list_scores.count():
             self.list_scores.setCurrentRow(0)

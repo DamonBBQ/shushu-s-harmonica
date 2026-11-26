@@ -91,6 +91,7 @@ def load_txt(path: str | Path) -> Score:
     text = path.read_text(encoding='utf-8-sig')
     title = path.stem
     bpm = 100
+    grid = 1
     body: list[str] = []
 
     for raw in text.splitlines():
@@ -105,11 +106,18 @@ def load_txt(path: str | Path) -> Score:
                 bpm = int(round(float(line.split('=', 1)[-1].strip())))
             except ValueError:
                 pass
+        elif upper.startswith('GRID'):
+            try:
+                grid = int(line.split('=', 1)[-1].strip())
+            except ValueError:
+                pass
         else:
             body.append(line)
 
     bpm = max(20, min(300, bpm))
+    grid = max(1, min(16, grid))
     beat = 60.0 / bpm
+    unit = beat / grid
     cursor = 0.0
     events: list[ScoreEvent] = []
     last_kind = ''
@@ -122,17 +130,17 @@ def load_txt(path: str | Path) -> Score:
             if set(token) == {'-'}:
                 count = len(token)
                 if last_kind == 'note' and last_event is not None:
-                    last_event.duration += count * beat
+                    last_event.duration += count * unit
                 if last_kind in ('note', 'rest'):
-                    cursor += count * beat
+                    cursor += count * unit
                 continue
             match = _TXT_TOKEN.fullmatch(token)
             if not match:
                 continue
             prefix, symbol, trailing = match.group(1).lower(), match.group(2).lower(), match.group(3)
-            beats = 1 + len(trailing)
+            units = 1 + len(trailing)
             if symbol == '0':
-                cursor += beats * beat
+                cursor += units * unit
                 last_kind = 'rest'
                 last_event = None
                 continue
@@ -140,14 +148,14 @@ def load_txt(path: str | Path) -> Score:
             degree = 1 if is_high_do else int(symbol)
             octave = prefix.count('^') - prefix.count('b') + (1 if is_high_do else 0)
             pitch = 60 + octave * 12 + _NOTE_OFFSETS[degree - 1] + (1 if '#' in prefix else 0)
-            event = ScoreEvent(pitch=pitch, start=cursor, duration=beats * beat)
+            event = ScoreEvent(pitch=pitch, start=cursor, duration=units * unit)
             events.append(event)
-            cursor += beats * beat
+            cursor += units * unit
             last_kind = 'note'
             last_event = event
 
     if not events:
-        raise ValueError('TXT 中没有可解析的音符（支持 1-7、8/i、b 降调、^ 升调、# 半音、0 休止、- 延长）')
+        raise ValueError('TXT 中没有可解析的音符（支持 1-7、8/i、b 降调、^ 升调、# 半音、0 休止、- 延长、GRID 网格）')
 
     events.sort(key=lambda e: e.start)
     return Score(name=title, events=events, length=cursor)

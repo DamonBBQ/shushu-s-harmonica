@@ -1,0 +1,226 @@
+{
+  "兰亭序": {
+    "artist": "周杰伦",
+    "bpm": 76,
+    "source_bpm": 152,
+    "source": "https://songbpm.com/@jay-chou/lan-ting-xu",
+    "note": "SongBPM 152 为倍速记法，取半速 76"
+  },
+  "失眠": {
+    "artist": "未确认",
+    "bpm": 70,
+    "source_bpm": null,
+    "source": "",
+    "note": "未找到可靠发行版本，按抒情曲估 70，可自行调速"
+  },
+  "等你的季节": {
+    "artist": "刘诗诗",
+    "bpm": 72,
+    "source_bpm": null,
+    "source": "https://www.shazam.com/zh-cn/song/1108390604/",
+    "note": "页面无 BPM 字段，按原曲听感估 72"
+  },
+  "发如雪": {
+    "artist": "周杰伦",
+    "bpm": 72,
+    "source_bpm": 116,
+    "source": "https://songbpm.com/@jay-chou/fa-ru-xue",
+    "note": "116 更接近倍速记法；独奏取 72，保留长句呼吸"
+  },
+  "断了的弦": {
+    "artist": "周杰伦",
+    "bpm": 92,
+    "source_bpm": 92,
+    "source": "https://mojim.org/song/254641",
+    "note": "按歌曲中速 R&B 感取 92"
+  },
+  "暗号": {
+    "artist": "周杰伦",
+    "bpm": 108,
+    "source_bpm": 126,
+    "source": "https://songbpm.com/@jay-chou/an-hao",
+    "note": "原曲有大量十六分连音；取 108 兼顾可读性与律动"
+  },
+  "call of silence": {
+    "artist": "澤野弘之",
+    "bpm": 61,
+    "source_bpm": 61,
+    "source": "https://www.shazam.com/",
+    "note": "慢板，取 61"
+  },
+  "搁浅": {
+    "artist": "周杰伦",
+    "bpm": 70,
+    "source_bpm": 123,
+    "source": "https://songbpm.com/@jay-chou/ge-qian",
+    "note": "123 为倍速记法，取接近半速的 70"
+  },
+  "说了再见": {
+    "artist": "周杰伦",
+    "bpm": 84,
+    "source_bpm": 129,
+    "source": "https://mojim.org/song/246888",
+    "note": "129/61 两种记法之间取 84，避免八分音符过慢"
+  },
+  "最长的电影": {
+    "artist": "周杰伦",
+    "bpm": 64,
+    "source_bpm": 121,
+    "source": "https://songbpm.com/@jay-chou/zui-chang-de-dian-ying",
+    "note": "121 为倍速记法，慢板取 64"
+  },
+  "诀别书": {
+    "artist": "邓垚",
+    "bpm": 66,
+    "source_bpm": 120,
+    "source": "https://www.midishow.com/",
+    "note": "MIDI 编曲 120；钢琴挽歌取 66"
+  },
+  "于是": {
+    "artist": "何欣穗",
+    "bpm": 76,
+    "source_bpm": 70,
+    "source": "https://www.shazam.com/zh-cn/song/1498913448/",
+    "note": "原曲约 70，取 76 让长句更连贯"
+  },
+  "雨爱": {
+    "artist": "杨丞琳",
+    "bpm": 80,
+    "source_bpm": 80,
+    "source": "https://www.midishow.com/",
+    "note": "按 80 的中速抒情"
+  },
+  "烟花易冷": {
+    "artist": "周杰伦",
+    "bpm": 77,
+    "source_bpm": 77,
+    "source": "https://songbpm.com/@jay-chou/yan-hua-yi-leng",
+    "note": "原曲速度"
+  },
+  "反方向的钟": {
+    "artist": "周杰伦",
+    "bpm": 95,
+    "source_bpm": 95,
+    "source": "https://songbpm.com/@jay-chou/fan-fang-xiang-de-zhong",
+    "note": "原曲速度"
+  },
+  "青花瓷": {
+    "artist": "周杰伦",
+    "bpm": 108,
+    "source_bpm": 108,
+    "source": "https://songbpm.com/@jay-chou/qing-hua-ci",
+    "note": "SongBPM 108；不取 54，避免八分音符拖成慢板"
+  },
+  "花海": {
+    "artist": "周杰伦",
+    "bpm": 75,
+    "source_bpm": 75,
+    "source": "https://songbpm.com/@jay-chou/hua-hai",
+    "note": "原曲速度"
+  },
+  "太聪明": {
+    "artist": "陈绮贞",
+    "bpm": 96,
+    "source_bpm": 65,
+    "source": "https://www.midishow.com/",
+    "note": "MIDI 65 偏慢；按原曲轻快律动取 96"
+  },
+  "最后一页": {
+    "artist": "江语晨",
+    "bpm": 72,
+    "source_bpm": 69,
+    "source": "https://www.midishow.com/",
+    "note": "取整到 72"
+  },
+  "鸟之诗": {
+    "artist": "Lia",
+    "bpm": 96,
+    "source_bpm": 120,
+    "source": "https://baike.baidu.com/item/鸟之诗",
+    "note": "120 为常见记法；独奏取 96 让十六分连音可弹"
+  },
+  "坏女孩": {
+    "artist": "徐良 / 小凌",
+    "bpm": 120,
+    "source_bpm": 132,
+    "source": "",
+    "note": "原曲约 130；取 120 保留轻快感且不丢音"
+  },
+  "雨下一整晚": {
+    "artist": "周杰伦",
+    "bpm": 80,
+    "source_bpm": 80,
+    "source": "https://songbpm.com/@jay-chou/yu-xia-yi-zheng-wan",
+    "note": "原曲速度"
+  },
+  "明明就": {
+    "artist": "周杰伦",
+    "bpm": 108,
+    "source_bpm": 113,
+    "source": "https://songbpm.com/@jay-chou/ming-ming-jiu",
+    "note": "113 接近原速，取 108 便于界面微调"
+  },
+  "这么可爱的鼠鼠为啥不能养": {
+    "artist": "网络曲",
+    "bpm": 100,
+    "source_bpm": null,
+    "source": "",
+    "note": "无可靠来源，按轻快 demo 估 100"
+  },
+  "你是我的风景": {
+    "artist": "何洁",
+    "bpm": 100,
+    "source_bpm": 100,
+    "source": "https://metrics.musicstax.com/",
+    "note": "按原曲速度"
+  },
+  "情歌-梁静茹": {
+    "artist": "梁静茹",
+    "bpm": 72,
+    "source_bpm": 140,
+    "source": "https://songbpm.com/@fish-leong/qing-ge",
+    "note": "140 为倍速记法，取 72"
+  },
+  "夏天的风": {
+    "artist": "温岚",
+    "bpm": 88,
+    "source_bpm": 90,
+    "source": "",
+    "note": "按 90 的钢琴谱速度微调到 88"
+  },
+  "如果爱忘了": {
+    "artist": "戚薇",
+    "bpm": 74,
+    "source_bpm": 74,
+    "source": "https://www.jitatang.cn/185346.html",
+    "note": "原曲速度"
+  },
+  "海阔天空": {
+    "artist": "Beyond",
+    "bpm": 76,
+    "source_bpm": 76,
+    "source": "https://www.shazam.com/",
+    "note": "原曲速度"
+  },
+  "我怀念的": {
+    "artist": "孙燕姿",
+    "bpm": 68,
+    "source_bpm": 129,
+    "source": "https://mojim.org/song/34590",
+    "note": "129/69 两种记法，取 68"
+  },
+  "一直很安静": {
+    "artist": "阿桑",
+    "bpm": 90,
+    "source_bpm": 90,
+    "source": "https://m.jitaba.net/pu/10099.html",
+    "note": "按吉他谱速度"
+  },
+  "wonderful u": {
+    "artist": "AGA",
+    "bpm": 59,
+    "source_bpm": 59,
+    "source": "https://chordu.com/",
+    "note": "原曲速度"
+  }
+}
