@@ -220,6 +220,23 @@ MINI_WINDOW_STYLE = '''
     QPushButton#miniStop:hover { background-color: #473244; border-color: #8E6178; }
     QPushButton#miniStop:pressed { background-color: #2B2230; }
     QPushButton#miniRestore { padding: 2px 7px; }
+    QPushButton#miniChoose:checked { background-color: #284565; border-color: #6088B5; }
+    QListWidget#miniScoreList {
+        background-color: #101A29;
+        color: #DFEAF8;
+        border: 1px solid #344960;
+        border-radius: 6px;
+        padding: 3px;
+        outline: none;
+        font-size: 12px;
+    }
+    QListWidget#miniScoreList::item { padding: 4px 7px; border-radius: 4px; }
+    QListWidget#miniScoreList::item:hover { background-color: #223B59; }
+    QListWidget#miniScoreList::item:selected { color: #F2F7FF; background-color: #284565; }
+    QScrollBar:vertical { width: 8px; background-color: #101A29; }
+    QScrollBar::handle:vertical { min-height: 20px; background-color: #415977; border-radius: 3px; }
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background-color: transparent; }
     QSlider::groove:horizontal { height: 4px; background-color: #354C67; border-radius: 2px; }
     QSlider::sub-page:horizontal { background-color: #6D9EDB; border-radius: 2px; }
     QSlider::handle:horizontal { width: 12px; margin: -4px 0; border-radius: 6px; background-color: #C5DFFF; }

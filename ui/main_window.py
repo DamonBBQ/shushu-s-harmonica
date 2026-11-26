@@ -4,7 +4,7 @@ import shutil
 import sys
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QPoint, QSettings, QSignalBlocker, Qt, QTimer, Signal
@@ -103,6 +103,7 @@ class MainWindow(QMainWindow):
         self._score_loading = False
         self._score_cache = OrderedDict()
         self._plan = None
+        self._pending_mini_score: Path | None = None
         self._settings = QSettings('DamonBBQ', 'shushu-s-harmonica')
 
         self._build_ui()
@@ -346,8 +347,7 @@ class MainWindow(QMainWindow):
 
     def _build_mini_window(self):
         self._mini = MiniWindow()
-        self._mini.previous_requested.connect(lambda: self._select_adjacent_score(-1))
-        self._mini.next_requested.connect(lambda: self._select_adjacent_score(1))
+        self._mini.score_selected.connect(self._select_mini_score)
         self._mini.play_requested.connect(self._start_play)
         self._mini.pause_requested.connect(self._toggle_pause)
         self._mini.stop_requested.connect(self._stop)
@@ -435,6 +435,7 @@ class MainWindow(QMainWindow):
                 self.list_scores.addItem(item)
             if files:
                 self.list_scores.setCurrentRow(selected_row)
+        self._sync_mini_library()
         self._update_info()
 
     def _selected_path(self) -> Path | None:
@@ -443,16 +444,43 @@ class MainWindow(QMainWindow):
             return None
         return Path(item.data(Qt.UserRole))
 
-    def _select_adjacent_score(self, offset: int):
-        if not self.list_scores.isEnabled():
+    def _sync_mini_library(self):
+        paths = [Path(self.list_scores.item(row).data(Qt.UserRole))
+                 for row in range(self.list_scores.count())]
+        stems = Counter(path.stem.casefold() for path in paths)
+        titles = [path.name if stems[path.stem.casefold()] > 1 else path.stem for path in paths]
+        self._mini.set_library(titles, self.list_scores.currentRow())
+
+    def _select_mini_score(self, row: int):
+        if self._closing or not 0 <= row < self.list_scores.count():
             return
-        row = self.list_scores.currentRow() + offset
-        if 0 <= row < self.list_scores.count():
-            self.list_scores.setCurrentRow(row)
+        target = Path(self.list_scores.item(row).data(Qt.UserRole))
+        if self._pending_mini_score is not None:
+            self._pending_mini_score = target
+            return
+        if row == self.list_scores.currentRow():
+            return
+        if self._state in _ACTIVE_STATES or (self._player and self._player.active):
+            self._pending_mini_score = target
+            self._stop()
+            self._update_controls()
+            return
+        self.list_scores.setCurrentRow(row)
+
+    def _apply_pending_mini_score(self):
+        target = self._pending_mini_score
+        self._pending_mini_score = None
+        if target is None or self._closing:
+            return
+        for row in range(self.list_scores.count()):
+            if Path(self.list_scores.item(row).data(Qt.UserRole)) == target:
+                self.list_scores.setCurrentRow(row)
+                return
 
     def _on_score_selected(self):
         self.lbl_progress.setText('就绪')
         self.track_progress.setValue(0)
+        self._sync_mini_library()
         self._update_info()
 
     def _update_info(self):
@@ -566,7 +594,8 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def _start_play(self):
-        if self._closing or self._state in _ACTIVE_STATES or (self._player and self._player.active):
+        if (self._closing or self._pending_mini_score is not None
+                or self._state in _ACTIVE_STATES or (self._player and self._player.active)):
             return
         self._update_info()
         if self._plan is None:
@@ -665,7 +694,7 @@ class MainWindow(QMainWindow):
 
     def _update_controls(self):
         active = self._state in _ACTIVE_STATES or (self._player is not None and self._player.active)
-        configurable = not active and not self._closing
+        configurable = not active and not self._closing and self._pending_mini_score is None
         self.btn_play.setEnabled(configurable and self._plan is not None and bool(self._plan[1]))
         self.btn_stop.setEnabled(active and not self._closing)
         self.btn_pause.setEnabled(not self._closing and self._state in ('playing', 'waiting_game', 'paused'))
@@ -679,17 +708,16 @@ class MainWindow(QMainWindow):
         self._update_mini()
 
     def _update_mini(self):
-        row = self.list_scores.currentRow()
         item = self.list_scores.currentItem()
         title = self._plan[0].name if self._plan is not None else (item.text() if item else '')
         self.lbl_track.setText(title or '未选曲谱')
         self.lbl_track.setToolTip(title)
-        can_select = item is not None and self.list_scores.isEnabled()
         progress = self.lbl_progress.text() if self._plan is not None else self.lbl_info.text()
+        if self._pending_mini_score is not None:
+            progress = '正在切换曲目…'
         self._mini.set_snapshot(
             title, self.lbl_state.text(), progress,
-            can_previous=can_select and row > 0,
-            can_next=can_select and row + 1 < self.list_scores.count(),
+            can_select=not self._closing and self.list_scores.count() > 0,
             can_play=self.btn_play.isEnabled(),
             can_pause=self.btn_pause.isEnabled(),
             can_stop=self.btn_stop.isEnabled(),
@@ -710,6 +738,8 @@ class MainWindow(QMainWindow):
         elif state == 'idle' and previous != 'finished':
             self.lbl_progress.setText('就绪')
             self.track_progress.setValue(0)
+        if state == 'idle':
+            self._apply_pending_mini_score()
         self._update_controls()
 
     def _on_progress(self, index: int, total: int, action: str):
