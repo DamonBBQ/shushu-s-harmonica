@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QListWidget, QMessageBox, QPushButto
 
 from core.engine import PlaybackOptions
 from core.input_backend import DryRunBackend
-from core.updater import RemoteScore, UpdateCheck, git_blob_sha
+from core.updater import RemoteScore, UpdateCheck, UpdateError, git_blob_sha
 from ui import main_window
 
 
@@ -178,6 +178,17 @@ class MiniWindowTest(unittest.TestCase):
         self.assertTrue(self.window.btn_update.isEnabled())
         self.assertIn('已是最新', self.window.lbl_update.text())
         information.assert_called_once()
+
+    def test_update_network_failure_restores_controls(self):
+        with (patch.object(main_window.ScoreUpdater, 'check_for_updates',
+                           side_effect=UpdateError('无法连接 GitHub 更新服务器：offline')),
+              patch.object(main_window.QMessageBox, 'warning') as warning):
+            self.window.btn_update.click()
+            self.wait_for(lambda: not self.window._updating)
+
+        self.assertTrue(self.window.btn_update.isEnabled())
+        self.assertEqual(self.window.lbl_update.text(), '更新失败')
+        warning.assert_called_once()
 
     def test_update_install_refreshes_library_and_keeps_existing_scores(self):
         data = 'TITLE=第四首\nBPM=60\n7-- 1\n'.encode('utf-8')

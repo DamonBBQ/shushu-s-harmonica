@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from urllib.error import URLError
 
 import mido
 
@@ -182,6 +183,16 @@ class ScoreUpdaterTests(unittest.TestCase):
             check = self.updater.check_for_updates()
 
         self.assertEqual(check.updates, ())
+
+    def test_network_failure_is_reported_without_touching_scores(self):
+        original = b'TITLE=local\nBPM=60\n1 2\n'
+        (self.scores_dir / 'local.txt').write_bytes(original)
+
+        with patch('core.updater.urlopen', side_effect=URLError('offline')):
+            with self.assertRaisesRegex(UpdateError, '无法连接 GitHub'):
+                self.updater.check_for_updates()
+
+        self.assertEqual((self.scores_dir / 'local.txt').read_bytes(), original)
 
     def test_install_backs_up_replaced_scores_and_keeps_custom_files(self):
         old_data = b'TITLE=changed\nBPM=60\n1\n'
