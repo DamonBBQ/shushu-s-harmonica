@@ -190,6 +190,16 @@ class MiniWindowTest(unittest.TestCase):
         self.assertEqual(self.window.lbl_update.text(), '更新失败')
         warning.assert_called_once()
 
+    def test_update_check_reports_local_name_conflicts(self):
+        check = UpdateCheck(updates=(), total=4, local_conflicts=('d.txt',))
+        with (patch.object(main_window.ScoreUpdater, 'check_for_updates', return_value=check),
+              patch.object(main_window.QMessageBox, 'information') as information):
+            self.window.btn_update.click()
+            self.wait_for(lambda: not self.window._updating)
+
+        self.assertIn('保留 1 个本地同名曲目', self.window.lbl_update.text())
+        self.assertIn('本地同名曲谱', information.call_args.args[2])
+
     def test_update_install_refreshes_library_and_keeps_existing_scores(self):
         data = 'TITLE=第四首\nBPM=60\n7-- 1\n'.encode('utf-8')
         remote = RemoteScore(name='d.txt', blob_sha=git_blob_sha(data), size=len(data))

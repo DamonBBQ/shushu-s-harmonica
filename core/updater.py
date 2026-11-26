@@ -21,6 +21,7 @@ _BRANCH = 'main'
 _API_URL = f'https://api.github.com/repos/{_REPOSITORY}/contents/scores?ref={_BRANCH}'
 _RAW_ROOT = f'https://raw.githubusercontent.com/{_REPOSITORY}/{_BRANCH}/scores'
 _SCORE_SUFFIXES = ('.mid', '.midi', '.txt')
+_MANIFEST_NAME = '.git-scores.json'
 _TIMEOUT_SECONDS = 20
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_SCORE_BYTES = 8 * 1024 * 1024
@@ -43,6 +44,7 @@ class RemoteScore:
 class UpdateCheck:
     updates: tuple[RemoteScore, ...]
     total: int
+    local_conflicts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -124,7 +126,9 @@ class ScoreUpdater:
 
     def check_for_updates(self) -> UpdateCheck:
         remote_scores = _fetch_remote_scores()
+        managed_scores = self._load_managed_scores()
         updates: list[RemoteScore] = []
+        local_conflicts: list[str] = []
         for remote in remote_scores:
             path = self.scores_dir / remote.name
             try:
@@ -134,13 +138,20 @@ class ScoreUpdater:
                 continue
             except OSError as exc:
                 raise UpdateError(f'无法读取本地曲谱 {remote.name}：{exc}') from exc
+            if remote.name not in managed_scores:
+                local_conflicts.append(remote.name)
+                continue
             if git_blob_sha(local_data) != remote.blob_sha:
                 # Windows checkouts may convert LF to CRLF while Git stores normalized text.
                 if (path.suffix.lower() == '.txt'
                         and git_blob_sha(local_data.replace(b'\r\n', b'\n')) == remote.blob_sha):
                     continue
                 updates.append(remote)
-        return UpdateCheck(updates=tuple(updates), total=len(remote_scores))
+        return UpdateCheck(
+            updates=tuple(updates),
+            total=len(remote_scores),
+            local_conflicts=tuple(local_conflicts),
+        )
 
     def install_updates(
         self,
@@ -151,6 +162,9 @@ class ScoreUpdater:
             return InstallResult(installed=(), backup_dir=None)
         if sum(update.size for update in updates) > _MAX_TOTAL_BYTES:
             raise UpdateError('本次曲库更新超过允许的总大小，已取消下载')
+        managed_scores = self._load_managed_scores()
+        updated_managed = managed_scores | {update.name for update in updates}
+        manifest_changed = updated_managed != managed_scores
 
         try:
             self.scores_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +188,10 @@ class ScoreUpdater:
                     if progress:
                         progress(index, len(updates), update.name)
 
+                if manifest_changed:
+                    (staging / _MANIFEST_NAME).write_text(
+                        self._serialize_manifest(updated_managed), encoding='utf-8')
+
                 for update in updates:
                     target = self.scores_dir / update.name
                     backup: Path | None = None
@@ -185,6 +203,17 @@ class ScoreUpdater:
                     os.replace(staging / update.name, target)
                     replaced.append((target, backup))
                     installed.append(target)
+
+                if manifest_changed:
+                    target = self.scores_dir / _MANIFEST_NAME
+                    backup: Path | None = None
+                    if target.exists():
+                        if backup_dir is None:
+                            backup_dir = self._new_backup_dir()
+                        backup = backup_dir / _MANIFEST_NAME
+                        shutil.copy2(target, backup)
+                    os.replace(staging / _MANIFEST_NAME, target)
+                    replaced.append((target, backup))
         except UpdateError:
             self._rollback(replaced)
             raise
@@ -193,6 +222,35 @@ class ScoreUpdater:
             raise UpdateError(f'安装曲库更新失败：{exc}') from exc
 
         return InstallResult(installed=tuple(installed), backup_dir=backup_dir)
+
+    def _load_managed_scores(self) -> set[str]:
+        path = self.scores_dir / _MANIFEST_NAME
+        try:
+            raw = path.read_text(encoding='utf-8')
+        except FileNotFoundError:
+            return set()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise UpdateError(f'无法读取 Git 曲目清单：{exc}') from exc
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise UpdateError('Git 曲目清单格式损坏，已取消更新') from exc
+        if (not isinstance(data, dict) or data.get('version') != 1
+                or not isinstance(data.get('scores'), list)):
+            raise UpdateError('Git 曲目清单格式不正确，已取消更新')
+
+        managed: set[str] = set()
+        for name in data['scores']:
+            if (not isinstance(name, str) or Path(name).suffix.lower() not in _SCORE_SUFFIXES
+                    or '/' in name or '\\' in name or Path(name).name != name):
+                raise UpdateError('Git 曲目清单包含无效文件名，已取消更新')
+            managed.add(name)
+        return managed
+
+    @staticmethod
+    def _serialize_manifest(scores: set[str]) -> str:
+        payload = {'version': 1, 'scores': sorted(scores, key=str.casefold)}
+        return json.dumps(payload, ensure_ascii=False, indent=2) + '\n'
 
     def _download(self, update: RemoteScore) -> bytes:
         data = _read_url(f'{_RAW_ROOT}/{quote(update.name, safe="")}', _MAX_SCORE_BYTES)

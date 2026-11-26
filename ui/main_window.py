@@ -191,7 +191,7 @@ class MainWindow(QMainWindow):
         self.btn_refresh.clicked.connect(lambda: self._refresh_scores())
         self.btn_update = QPushButton('检查更新')
         self.btn_update.setObjectName('updateButton')
-        self.btn_update.setToolTip('从 GitHub main 分支更新内置曲谱，保留自行添加的曲谱')
+        self.btn_update.setToolTip('从 GitHub main 分支更新 Git 清单中的内置曲谱，本地同名曲目保留')
         self.btn_update.clicked.connect(self._check_for_updates)
         row.addWidget(self.btn_add, 1)
         row.addWidget(self.btn_refresh)
@@ -480,19 +480,30 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         count = len(check.updates)
+        conflict_count = len(check.local_conflicts)
+        if conflict_count:
+            self._append_log('保留本地同名曲谱：' + '、'.join(check.local_conflicts))
         if not count:
             self._updating = False
-            self.lbl_update.setText(f'已是最新曲库（共检查 {check.total} 个文件）')
+            suffix = f'；保留 {conflict_count} 个本地同名曲目' if conflict_count else ''
+            self.lbl_update.setText(f'已是最新曲库（共检查 {check.total} 个文件）{suffix}')
             self._append_log('在线曲库检查完成：已是最新')
             self._update_controls()
-            QMessageBox.information(self, '检查更新', '当前曲库已是最新。')
+            message = '当前曲库已是最新。'
+            if conflict_count:
+                message += f'\n另有 {conflict_count} 个本地同名曲谱不在 Git 清单中，已保留不覆盖。'
+            QMessageBox.information(self, '检查更新', message)
             return
 
+        conflict_hint = ''
+        if conflict_count:
+            conflict_hint = f'\n\n另有 {conflict_count} 个本地同名曲谱不在 Git 清单中，将保留不覆盖。'
         answer = QMessageBox.question(
             self,
             '发现曲库更新',
             f'发现 {count} 个新增或更新的曲谱，是否下载并安装？\n\n'
-            '远端内置同名谱会被更新，原文件会备份；自行添加且远端没有的曲谱会保留。',
+            'Git 清单内的同名谱会被更新，原文件会备份；本地曲目不会被覆盖。'
+            f'{conflict_hint}',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )

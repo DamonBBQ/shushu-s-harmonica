@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from pathlib import Path
@@ -154,6 +155,18 @@ class ScoreUpdaterTests(unittest.TestCase):
     def remote(name: str, data: bytes) -> RemoteScore:
         return RemoteScore(name=name, blob_sha=git_blob_sha(data), size=len(data))
 
+    def write_manifest(self, names):
+        path = self.scores_dir / '.git-scores.json'
+        path.write_text(json.dumps({'version': 1, 'scores': list(names)}), encoding='utf-8')
+
+    def test_bundled_git_manifest_matches_score_files(self):
+        scores = Path(__file__).resolve().parents[1] / 'scores'
+        manifest = json.loads((scores / '.git-scores.json').read_text(encoding='utf-8'))
+        actual = {path.name for path in scores.iterdir()
+                  if path.suffix.lower() in ('.mid', '.midi', '.txt')}
+        self.assertEqual(manifest['version'], 1)
+        self.assertEqual(set(manifest['scores']), actual)
+
     def test_check_detects_only_changed_or_missing_scores(self):
         same_data = b'TITLE=same\nBPM=60\n1 2\n'
         old_data = b'TITLE=changed\nBPM=60\n1\n'
@@ -162,6 +175,7 @@ class ScoreUpdaterTests(unittest.TestCase):
         (self.scores_dir / 'same.txt').write_bytes(same_data)
         (self.scores_dir / 'changed.txt').write_bytes(old_data)
         (self.scores_dir / 'custom.txt').write_bytes(b'TITLE=custom\nBPM=60\n5 6\n')
+        self.write_manifest(['same.txt', 'changed.txt'])
         remote = (
             self.remote('same.txt', same_data),
             self.remote('added.txt', added_data),
@@ -177,6 +191,7 @@ class ScoreUpdaterTests(unittest.TestCase):
     def test_windows_crlf_checkout_matches_git_blob(self):
         data = b'TITLE=same\nBPM=60\n1 2\n'
         (self.scores_dir / 'same.txt').write_bytes(data.replace(b'\n', b'\r\n'))
+        self.write_manifest(['same.txt'])
         remote = (self.remote('same.txt', data),)
 
         with patch('core.updater._fetch_remote_scores', return_value=remote):
@@ -201,6 +216,7 @@ class ScoreUpdaterTests(unittest.TestCase):
         custom_data = b'TITLE=custom\nBPM=60\n5 6\n'
         (self.scores_dir / 'changed.txt').write_bytes(old_data)
         (self.scores_dir / 'custom.txt').write_bytes(custom_data)
+        self.write_manifest(['changed.txt'])
         updates = (
             self.remote('changed.txt', new_data),
             self.remote('added.txt', added_data),
@@ -217,12 +233,15 @@ class ScoreUpdaterTests(unittest.TestCase):
         self.assertIsNotNone(result.backup_dir)
         self.assertEqual((result.backup_dir / 'changed.txt').read_bytes(), old_data)
         self.assertEqual(progress, [(1, 2, 'changed.txt'), (2, 2, 'added.txt')])
+        manifest = json.loads((self.scores_dir / '.git-scores.json').read_text(encoding='utf-8'))
+        self.assertEqual(set(manifest['scores']), {'changed.txt', 'added.txt'})
 
     def test_checksum_failure_does_not_replace_any_scores(self):
         old_data = b'TITLE=changed\nBPM=60\n1\n'
         valid_data = b'TITLE=added\nBPM=60\n3 4\n'
         broken_data = b'TITLE=changed\nBPM=60\n1 2\n'
         (self.scores_dir / 'changed.txt').write_bytes(old_data)
+        self.write_manifest(['changed.txt'])
         updates = (
             self.remote('added.txt', valid_data),
             self.remote('changed.txt', broken_data),
@@ -239,6 +258,7 @@ class ScoreUpdaterTests(unittest.TestCase):
         old_data = b'TITLE=changed\nBPM=60\n1\n'
         broken_data = b'not a supported score\n'
         (self.scores_dir / 'changed.txt').write_bytes(old_data)
+        self.write_manifest(['changed.txt'])
 
         with patch.object(self.updater, '_download', return_value=broken_data):
             with self.assertRaisesRegex(UpdateError, '无法解析'):
@@ -251,6 +271,7 @@ class ScoreUpdaterTests(unittest.TestCase):
         first_new = b'TITLE=first\nBPM=60\n1 2\n'
         second_new = b'TITLE=second\nBPM=60\n3 4\n'
         (self.scores_dir / 'first.txt').write_bytes(first_old)
+        self.write_manifest(['first.txt'])
         updates = (
             self.remote('first.txt', first_new),
             self.remote('second.txt', second_new),
@@ -269,3 +290,41 @@ class ScoreUpdaterTests(unittest.TestCase):
 
         self.assertEqual((self.scores_dir / 'first.txt').read_bytes(), first_old)
         self.assertFalse((self.scores_dir / 'second.txt').exists())
+        manifest = json.loads((self.scores_dir / '.git-scores.json').read_text(encoding='utf-8'))
+        self.assertEqual(manifest['scores'], ['first.txt'])
+
+    def test_local_same_name_is_reported_and_never_overwritten(self):
+        local_data = b'TITLE=local version\nBPM=60\n5 6\n'
+        remote_data = b'TITLE=git version\nBPM=60\n1 2\n'
+        (self.scores_dir / 'shared.txt').write_bytes(local_data)
+        remote = (self.remote('shared.txt', remote_data),)
+
+        with patch('core.updater._fetch_remote_scores', return_value=remote):
+            check = self.updater.check_for_updates()
+
+        self.assertEqual(check.updates, ())
+        self.assertEqual(check.local_conflicts, ('shared.txt',))
+        self.assertEqual((self.scores_dir / 'shared.txt').read_bytes(), local_data)
+
+    def test_new_git_score_is_added_to_manifest(self):
+        data = b'TITLE=new git score\nBPM=60\n1 2\n'
+        remote = self.remote('new.txt', data)
+
+        with patch.object(self.updater, '_download', return_value=data):
+            self.updater.install_updates((remote,))
+
+        manifest = json.loads((self.scores_dir / '.git-scores.json').read_text(encoding='utf-8'))
+        self.assertEqual(manifest['scores'], ['new.txt'])
+
+    def test_corrupt_manifest_stops_update_before_download(self):
+        original = b'TITLE=local\nBPM=60\n1 2\n'
+        (self.scores_dir / 'song.txt').write_bytes(original)
+        (self.scores_dir / '.git-scores.json').write_text('{broken', encoding='utf-8')
+        remote = (self.remote('song.txt', b'TITLE=git\nBPM=60\n3 4\n'),)
+
+        with patch.object(self.updater, '_download') as download:
+            with self.assertRaisesRegex(UpdateError, '清单格式损坏'):
+                self.updater.install_updates(remote)
+
+        download.assert_not_called()
+        self.assertEqual((self.scores_dir / 'song.txt').read_bytes(), original)
