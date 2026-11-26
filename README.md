@@ -31,13 +31,12 @@
 - [已验证与待验证](#已验证与待验证)
 - [常见问题](#常见问题)
 - [已知限制](#已知限制)
-- [参考资料](#参考资料)
 
 ---
 
 ## 功能特性
 
-- **双曲谱来源**：标准 MIDI（`.mid` / `.midi`，type 0/1）与简谱 TXT（visualizer 风格）。
+- **双曲谱来源**：标准 MIDI（`.mid` / `.midi`，type 0/1）与简谱 TXT。
 - **完整音域映射**：覆盖游戏口琴 MIDI 48–85（C3–C#6），包含最高音区 `逗号` 键的特殊规则。
 - **自动单音化**：多轨/和弦 MIDI 优先选同一簇中能在当前速度下演奏的最高音，适配游戏单音口琴。
 - **移调**：手动 ±12 半音；支持自动移调，最大化落进游戏音域的 note 数；超界音高自动八度折返。
@@ -189,7 +188,7 @@ keyup   目标时刻 = 实际终点 − 20ms
 
 ## 简谱 TXT 格式
 
-简单 TXT 使用 UTF-8 编码，记谱风格参考 harmonica-visualizer。 [曲谱格式](https://github.com/ChiZhou6/harmonica-visualizer#曲谱格式songs-文件夹里的-txt)
+简谱 TXT 使用 UTF-8 编码。
 
 ```text
 TITLE=小星星
@@ -202,7 +201,7 @@ BPM=100
 规则：
 
 - `TITLE=...`：曲名，可省略，默认使用文件名。
-- `BPM=...`：速度，可省略，默认 100。填写时须为有限数字，自动限制在 20–300 并取整。导入未指定速度的 visualizer 曲谱时，可显式写 `BPM=90` 保持原速度。 [visualizer 默认速度](https://github.com/ChiZhou6/harmonica-visualizer/blob/main/harmonica_visualizer.py#L463-L473)
+- `BPM=...` 表示速度，省略时为 100。填写时须为有限数字，自动限制在 20–300 并取整。
 - `//`：行内注释；`|` 视为分隔符（可当小节线使用）。
 - 音符：`1`–`7` 为自然音级，`0` 为休止。
 - `8` 或 `i`：高音 `do`（即 `1` 升一个八度，对应游戏 `,` 键）。
@@ -210,7 +209,7 @@ BPM=100
 - 后缀 `-`：延长一拍（每多一个 `-` 多一拍），例如 `5--` 为三拍。
 - 单独的 `-` token：延长前一个音符或休止一拍。
 - 以中央 C（C4，MIDI 60）为基准，`1` = C4。
-- 无法识别的记号会报出行号和原记号。HarmonicaPlayer 的 `@format` 与 Dr-hydra 的键位文本谱需要先转换为受支持的曲谱格式。
+- 无法识别的记号会报出行号和原记号。带 `@format` 的文本谱和键位文本谱需要先转换成标准 MIDI 或本节所述的简谱 TXT。
 
 ## MIDI 处理规则
 
@@ -219,7 +218,6 @@ BPM=100
 - `note_on` 且 velocity > 0 视为按下；`note_off` 或 velocity = 0 的 `note_on` 视为松开。
 - 各轨共用速度变化。按轨道、通道和音高匹配按下与松开。重复按下时先结算上一个音，文件结束仍按住的音按 0.5 秒收尾。曲谱长度保留轨道末尾的休止。
 - **单音化**：从每簇第一个起点起，把相差小于 30ms 的音归为一簇。每簇从高到低挑选一个能在当前速度下演奏的音，时值最晚截到下一簇起点。全簇都过短时跳过该簇。
-- Dr-hydra 曲库可导出「标准 MIDI .mid」再导入，程序按标准 MIDI 音符读取其中的旋律。 [Dr-hydra MIDI 导出说明](https://github.com/Dr-hydra/Delta-Force-Harmonica#桌面版自动演奏器)
 
 ## 移调与音域适配
 
@@ -335,18 +333,7 @@ python -m unittest discover -s tests -v
 
 - 仅演奏**单音**旋律。导入和弦或多轨 MIDI 时，每个近似同时起音的音组只取一个能演奏的音。
 - 暂不支持选择 MIDI 轨道、试听、播放列表、节拍器。
-- TXT 仅支持本 README 描述的简单格式，不支持 HarmonicaPlayer/1 的 `@format` 曲谱。
 - 最高音区只支持 C6/C#6（`do / #do`），更高音通过移调/八度折返处理。
 - 自动音域适配可能改变原曲的八度听感。
 - 热键固定为三组 Shift 组合，暂不可自定义。
 - 游戏进程名关键字默认 `DeltaForce`，不同客户端可能需要手动调整。
-
-## 参考资料
-
-- [ChiZhou6/harmonica-visualizer](https://github.com/ChiZhou6/harmonica-visualizer)：简谱 TXT 风格、键位与「切换修饰键会导致重触发」等游戏行为的参考。
-- [lanselanlanxi-wq/HarmonicaPlayer](https://github.com/lanselanlanxi-wq/HarmonicaPlayer)：MIDI 48–85 音域、最高音 `逗号` 规则、12ms 预备 / 40ms 最短保持 / 20ms 尾隙等时序参数的参考。
-- 文件拖放与播放模式互斥参考拾音。 [Delta_Music_Force](https://github.com/AlexBybye/Delta_Music_Force#怎么使用这个软件)
-- 标准 MIDI 导出和暂停时保留谱面进度参考 Dr-hydra。 [Delta-Force-Harmonica](https://github.com/Dr-hydra/Delta-Force-Harmonica/blob/main/docs/DESKTOP.md)
-- 虚拟时钟和记录型输入测试参考 HarmonicaScript。 [HarmonicaScript](https://github.com/LianZiZhou/HarmonicaScript#架构)
-
-本项目为独立的 Python 实现，映射与时序经过对照，并由本仓库的离线测试覆盖。

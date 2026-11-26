@@ -47,8 +47,8 @@ class ScoreTests(unittest.TestCase):
             ('BPM=120\n1 mistake 2', r'第 2 行.*mistake'),
             ('1\nBPM=inf', r'第 2 行.*BPM'),
             ('1\nBPM=nan', r'第 2 行.*BPM'),
-            ('\n@format HarmonicaPlayer/1\n1', r'第 2 行.*@format'),
-            ('示例 — 三角洲口琴谱\n键位标记 + - #\n1', r'第 2 行.*Dr-hydra'),
+            ('\n@format example/1\n1', r'第 2 行.*@format'),
+            ('示例 — 三角洲口琴谱\n键位标记 + - #\n1', r'第 2 行.*键位文本谱'),
         )
         for text, match in cases:
             with self.subTest(text=text), self.assertRaisesRegex(ValueError, match):

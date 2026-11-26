@@ -129,7 +129,7 @@ def load_txt(path: str | Path) -> Score:
         elif re.match(r'@format(?:\s|=|$)', line, re.IGNORECASE):
             raise ValueError(f'第 {line_number} 行声明了暂不支持的 @format 曲谱，请导入 MIDI 或基本简谱 TXT')
         elif '键位标记' in line or re.match(r'小节\s+\d+\s*\(', line):
-            raise ValueError(f'第 {line_number} 行识别到 Dr-hydra 键位谱，请从曲谱库导出 MIDI 后导入')
+            raise ValueError(f'第 {line_number} 行识别到键位文本谱，请转换为 MIDI 或基本简谱 TXT 后导入')
         else:
             body.append((line_number, line))
 

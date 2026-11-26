@@ -25,28 +25,21 @@
 - 不绕过游戏内曲谱解锁机制，仅演奏用户自备的 MIDI/简谱。
 - 不保证规避反作弊检测；使用风险由使用者承担。
 
-## 3. 参考实现提炼出的硬约束
+## 3. 键位与时序约束
 
-设计前对两个开源项目做了对照阅读：
+| 约束 | 实现 |
+|---|---|
+| 游戏可用音域为 MIDI 48–85（C3–C#6） | `RANGE_LOW=48`、`RANGE_HIGH=85` |
+| C5 用逗号键，C#5 加中键，C6 加右键，C#6 加右键和中键 | `to_action` 对 `pc in (0,1)` 且高八度时特判 |
+| 升半音使用下方自然音 + 中键 | `_SHARP_BASE` 映射 |
+| 音键按下前预留 12ms 准备修饰键 | `PREP_MS=12` |
+| 最短按键保持 40ms | `MIN_HOLD_MS=40` |
+| MIDI 和 TXT 的尾隙均为 20ms | `DEFAULT_GAP_MS=20` |
+| 固定预备、保持和尾隙合计 72ms | `build_play_notes` 按播放速度换算可用时长，跳过不足 72ms 的音 |
+| 按住音键时改变修饰键会重新触发音符 | 每个音独立使用修饰键，音键松开后才释放修饰键 |
+| 热键避开游戏使用的 F 键 | 统一使用 `Shift+F8/F9/F10` |
 
-- [ChiZhou6/harmonica-visualizer](https://github.com/ChiZhou6/harmonica-visualizer)
-- [lanselanlanxi-wq/HarmonicaPlayer](https://github.com/lanselanlanxi-wq/HarmonicaPlayer)
-
-提炼出的、直接影响本项目的约束：
-
-| 约束 | 来源 | 本项目落地 |
-|---|---|---|
-| 游戏可用音域为 MIDI 48–85（C3–C#6） | HarmonicaPlayer `HarmonicaPitchMap` | `RANGE_LOW=48`、`RANGE_HIGH=85` |
-| 最高音区只支持 `do / #do`：C5 用 `,`，C#5 用 `,`+中键，C6 用 `,`+右键，C#6 用 `,`+右键+中键 | HarmonicaPlayer `GameNoteInput` | `to_action` 对 `pc in (0,1)` 且高八度时特判 |
-| 升半音使用下方自然音 + 中键 | HarmonicaPlayer | `_SHARP_BASE` 映射 |
-| 音键按下前需 12ms 准备修饰键 | HarmonicaPlayer `GamePlaybackTiming` | `PREP_MS=12` |
-| 最短按键保持 40ms | HarmonicaPlayer | `MIN_HOLD_MS=40` |
-| 尾隙 20ms（TXT）；MIDI 导入为 10ms | HarmonicaPlayer | 统一取 20ms，见 §15 取舍 |
-| 固定预备、保持和尾隙合计 72ms | HarmonicaPlayer | `build_play_notes` 按播放速度换算可用时长，跳过不足 72ms 的音 |
-| 按住音键时改变修饰键会重新触发音符 | harmonica-visualizer | 每个音独立包裹修饰键，音键松开后才释放修饰键 |
-| 游戏占用大量 F 键，热键需避让 | harmonica-visualizer | 统一使用 `Shift+F8/F9/F10` |
-
-这些参考参数集中在 `core/mapping.py` 与 `core/engine.py`，方便实机校准。批量导入与播放生命周期参考拾音，暂停后保留进度参考 Dr-hydra，虚拟时钟和记录型后端参考 HarmonicaScript。 [拾音](https://github.com/AlexBybye/Delta_Music_Force) · [Dr-hydra 桌面文档](https://github.com/Dr-hydra/Delta-Force-Harmonica/blob/main/docs/DESKTOP.md) · [HarmonicaScript 架构](https://github.com/LianZiZhou/HarmonicaScript#架构)
+键位和时序参数集中在 `core/mapping.py` 与 `core/engine.py`，方便实机校准。
 
 ## 4. 总体架构
 
@@ -99,7 +92,6 @@ PlayNote(start, duration, key_index, shift, sharp) # 与设备无关的按键计
   1. 按起点排序，以每簇第一个音为基准合并起点相差小于 30ms 的音。
   2. 每簇按音高排序，保留较低音作为备选。
   3. 生成计划时，把每个候选音最晚截到下一簇起点，按速度计算可用时长。优先选择能够演奏的最高音。整簇无可用音时，记为一次跳过。
-- Dr-hydra 的标准 MIDI 下载已带单音旋律，按标准 MIDI 路径导入。 [导出实现](https://github.com/Dr-hydra/Delta-Force-Harmonica/blob/main/src/export/midi.ts#L29-L68)
 
 ### 6.2 简谱 TXT
 
@@ -115,7 +107,7 @@ BPM=100
 - 音符：`1`–`7`，`0` 休止，`8`/`i` 为高音 `do`（音级 1 升八度）。
 - 前缀：`b` 降八度（可叠加）、`^` 升八度（可叠加）、`#` 升半音。
 - 后缀 `-`：延长一拍；单独的 `-` token 延长前一个音符或休止。
-- 无法识别的记号会报告行号与原记号，整首没有音符也会报错。识别到 `@format` 或 Dr-hydra 键位文本谱时，提示改用受支持的曲谱格式。
+- 无法识别的记号会报告行号与原记号，整首没有音符也会报错。识别到 `@format` 或键位文本谱时，提示改用受支持的曲谱格式。
 - `BPM` 可省略，默认 100。显式填写时，有限数值限制在 20–300 后取整，非法值报告行号。
 
 ### 6.3 边界处理
@@ -160,7 +152,7 @@ if pc in (0, 1) and octave > 4:
     C#6 → 逗号 + 右键 + 中键
 ```
 
-为什么必须特判：如果按通用规则，C6 会变成 `Z + 右键 + 右键`（两个八度），而游戏只有单个八度修饰；参考实现正是用逗号键覆盖最高两个八度。`to_action` 的其余分支保持通用规则。
+C6 比 `Z` 对应的音高两个八度，游戏的右键只能升一个八度，因此从逗号键对应的 C5 升八度得到 C6。
 
 ### 7.2 移调与折叠
 
@@ -344,7 +336,7 @@ python -m unittest discover -s tests -v
 
 ## 15. 设计取舍
 
-1. **统一尾隙 20ms**：参考实现中 TXT 默认 20ms、MIDI 导入 10ms。本项目为降低维护复杂度与保证不粘连，统一取 20ms；如实机需要更连奏，可把 `DEFAULT_GAP_MS` 调小并重新验证最短时长。
+1. **统一尾隙 20ms**。MIDI 和 TXT 使用同一尾隙，给相邻音符留出间隔。实机校准时可调小 `DEFAULT_GAP_MS`，并重新验证最短时长。
 2. **高层单音化而非轨道选择**：MVP 优先「任意 MIDI 能直接弹」，用最高音启发式近似主旋律；后续可增加轨道选择或旋律检测。
 3. **整体移调优于逐音折叠**：保持旋律轮廓，减少八度跳变；代价是整体可能升降调。
 4. **ctypes 手写 SendInput**：依赖少、行为透明，也不引入第三方输入库；代价是需要自行维护结构体定义。
@@ -357,7 +349,7 @@ python -m unittest discover -s tests -v
 
 - Windows 实机校准：可配置的 `PREP/MS`、`MIN_HOLD`、`GAP`，并记录实测延迟。
 - MIDI 轨道选择与主旋律提取（按轨道/通道/音高分布）。
-- 支持 HarmonicaPlayer/1 `@format` 曲谱与更多 TXT 方言。
+- 扩展 TXT 曲谱格式支持。
 - 播放列表、拖动进度、任意段落循环、节拍器。
 - 音频预览与键位可视化（用于教学）。
 - 热键自定义与配置持久化。
