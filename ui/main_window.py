@@ -7,7 +7,8 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QSettings, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtGui import QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -31,6 +32,7 @@ from core.engine import PlaybackOptions, Player
 from core.hotkeys import (
     HOTKEY_EMERGENCY,
     HOTKEY_LABELS,
+    HOTKEY_MINI_WINDOW,
     HOTKEY_PAUSE,
     HOTKEY_START_STOP,
     GlobalHotkeys,
@@ -43,6 +45,7 @@ from core.input_backend import (
 )
 from core.mapping import build_play_notes, describe_action
 from core.score import load_score
+from ui.mini_window import DEFAULT_OPACITY, MAX_OPACITY, MIN_OPACITY, MiniWindow
 
 if getattr(sys, 'frozen', False):
     SCORES_DIR = Path(sys.executable).resolve().parent / 'scores'
@@ -72,6 +75,8 @@ class _Bridge(QObject):
 
 
 class MainWindow(QMainWindow):
+    closed = Signal()
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle('三角洲行动 · 口琴自动演奏器')
@@ -94,8 +99,10 @@ class MainWindow(QMainWindow):
         self._score_loading = False
         self._score_cache = OrderedDict()
         self._plan = None
+        self._settings = QSettings('DamonBBQ', 'shushu-s-harmonica')
 
         self._build_ui()
+        self._build_mini_window()
         self._apply_theme()
         self.setAcceptDrops(True)
         self._refresh_scores()
@@ -124,11 +131,17 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(16, 12, 16, 10)
         root.setSpacing(10)
 
+        title_row = QHBoxLayout()
         title = QLabel('三角洲行动 · 口琴自动演奏器')
         title.setObjectName('title')
+        title_row.addWidget(title, 1)
+        self.btn_mini = QPushButton('迷你浮窗  F11')
+        self.btn_mini.setToolTip('切换到置顶浮窗')
+        self.btn_mini.clicked.connect(self._toggle_mini)
+        title_row.addWidget(self.btn_mini)
+        root.addLayout(title_row)
         subtitle = QLabel('MIDI / 简谱 TXT → 自动模拟 Z X C V B N M , 与鼠标升降调键')
         subtitle.setObjectName('subtitle')
-        root.addWidget(title)
         root.addWidget(subtitle)
 
         body = QHBoxLayout()
@@ -139,7 +152,7 @@ class MainWindow(QMainWindow):
         left.setSpacing(8)
         left.addWidget(QLabel('曲库（scores 目录）'))
         self.list_scores = QListWidget()
-        self.list_scores.currentItemChanged.connect(lambda *_: self._update_info())
+        self.list_scores.currentItemChanged.connect(self._on_score_selected)
         self.list_scores.itemDoubleClicked.connect(lambda *_: self._start_play())
         left.addWidget(self.list_scores, 1)
         row = QHBoxLayout()
@@ -208,6 +221,20 @@ class MainWindow(QMainWindow):
         hint = QLabel('热键：Shift+F9 播放/停止 · Shift+F10 暂停/继续 · Shift+F8 急停')
         hint.setObjectName('hint')
         grid.addWidget(hint, 4, 0, 1, 3)
+
+        opacity_label = QLabel('浮窗不透明度')
+        self.slider_mini_opacity = QSlider(Qt.Horizontal)
+        self.slider_mini_opacity.setRange(MIN_OPACITY, MAX_OPACITY)
+        self.slider_mini_opacity.setAccessibleName(opacity_label.text())
+        opacity_label.setBuddy(self.slider_mini_opacity)
+        self.lbl_mini_opacity = QLabel('')
+        self.lbl_mini_opacity.setMinimumWidth(self.lbl_mini_opacity.fontMetrics().horizontalAdvance('100%'))
+        self.lbl_mini_opacity.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        opacity_row = QHBoxLayout()
+        opacity_row.addWidget(opacity_label)
+        opacity_row.addWidget(self.slider_mini_opacity, 1)
+        opacity_row.addWidget(self.lbl_mini_opacity)
+        grid.addLayout(opacity_row, 5, 0, 1, 3)
         right.addWidget(controls)
 
         safety = QGroupBox('安全设置')
@@ -246,6 +273,75 @@ class MainWindow(QMainWindow):
             self.lbl_perm.setText('权限：' + ('管理员' if is_process_elevated() else '普通用户'))
         else:
             self.lbl_perm.setText('开发模式（仅测试）')
+
+    def _build_mini_window(self):
+        self._mini = MiniWindow()
+        self._mini.previous_requested.connect(lambda: self._select_adjacent_score(-1))
+        self._mini.next_requested.connect(lambda: self._select_adjacent_score(1))
+        self._mini.play_requested.connect(self._start_play)
+        self._mini.pause_requested.connect(self._toggle_pause)
+        self._mini.stop_requested.connect(self._stop)
+        self._mini.restore_requested.connect(self._restore_main_from_mini)
+        self._mini.opacity_changed.connect(self._set_mini_opacity)
+        self.slider_mini_opacity.valueChanged.connect(self._set_mini_opacity)
+
+        try:
+            opacity = int(self._settings.value('miniWindow/opacity', DEFAULT_OPACITY))
+        except (TypeError, ValueError):
+            opacity = DEFAULT_OPACITY
+        self._set_mini_opacity(min(MAX_OPACITY, max(MIN_OPACITY, opacity)))
+
+        self._mini_shortcut = QShortcut(QKeySequence(Qt.Key_F11), self)
+        self._mini_shortcut.setAutoRepeat(False)
+        self._mini_shortcut.activated.connect(self._on_local_mini_shortcut)
+
+    def _set_mini_opacity(self, opacity: int):
+        self._mini.set_opacity(opacity)
+        with QSignalBlocker(self.slider_mini_opacity):
+            self.slider_mini_opacity.setValue(opacity)
+        self.lbl_mini_opacity.setText(f'{opacity}%')
+        self._settings.setValue('miniWindow/opacity', opacity)
+
+    def _on_local_mini_shortcut(self):
+        if not self._hotkeys.is_registered(HOTKEY_MINI_WINDOW):
+            self._toggle_mini()
+
+    def _toggle_mini(self):
+        if self._closing:
+            return
+        if self._mini.isVisible():
+            self._restore_main()
+        else:
+            self._update_mini()
+            self._place_mini()
+            self._mini.show()
+            self.hide()
+
+    def _place_mini(self):
+        saved = self._settings.value('miniWindow/position')
+        self._mini.place(saved if isinstance(saved, QPoint) else None, QCursor.pos())
+
+    def _save_mini_position(self):
+        if self._mini.isVisible():
+            self._settings.setValue('miniWindow/position', self._mini.pos())
+
+    def _restore_main_from_mini(self):
+        activate = self._state not in _ACTIVE_STATES and not (self._player and self._player.active)
+        self._restore_main(activate=activate)
+
+    def _restore_main(self, *, activate: bool = False):
+        if self._closing:
+            return
+        self._save_mini_position()
+        self.setAttribute(Qt.WA_ShowWithoutActivating, not activate)
+        if self.isMinimized():
+            self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
+        self.show()
+        self._mini.hide()
+        self.setAttribute(Qt.WA_ShowWithoutActivating, False)
+        if activate:
+            self.raise_()
+            self.activateWindow()
 
     def _apply_theme(self):
         self.setStyleSheet("""
@@ -306,6 +402,17 @@ class MainWindow(QMainWindow):
         if item is None:
             return None
         return Path(item.data(Qt.UserRole))
+
+    def _select_adjacent_score(self, offset: int):
+        if not self.list_scores.isEnabled():
+            return
+        row = self.list_scores.currentRow() + offset
+        if 0 <= row < self.list_scores.count():
+            self.list_scores.setCurrentRow(row)
+
+    def _on_score_selected(self):
+        self.lbl_progress.setText('就绪')
+        self._update_info()
 
     def _update_info(self):
         self._plan = None
@@ -512,6 +619,8 @@ class MainWindow(QMainWindow):
                 self._start_play()
         elif hotkey_id == HOTKEY_PAUSE:
             self._toggle_pause()
+        elif hotkey_id == HOTKEY_MINI_WINDOW:
+            self._toggle_mini()
 
     def _update_controls(self):
         active = self._state in _ACTIVE_STATES or (self._player is not None and self._player.active)
@@ -524,12 +633,30 @@ class MainWindow(QMainWindow):
                        self.chk_foreground, self.edit_process):
             widget.setEnabled(configurable)
         self.chk_dry.setEnabled(configurable and sys.platform == 'win32')
+        self.btn_mini.setEnabled(not self._closing)
+        self.slider_mini_opacity.setEnabled(not self._closing)
+        self._update_mini()
+
+    def _update_mini(self):
+        row = self.list_scores.currentRow()
+        item = self.list_scores.currentItem()
+        title = self._plan[0].name if self._plan is not None else (item.text() if item else '')
+        can_select = item is not None and self.list_scores.isEnabled()
+        progress = self.lbl_progress.text() if self._plan is not None else self.lbl_info.text()
+        self._mini.set_snapshot(
+            title, self.lbl_state.text(), progress,
+            can_previous=can_select and row > 0,
+            can_next=can_select and row + 1 < self.list_scores.count(),
+            can_play=self.btn_play.isEnabled(),
+            can_pause=self.btn_pause.isEnabled(),
+            can_stop=self.btn_stop.isEnabled(),
+            paused=self._state == 'paused',
+        )
 
     def _on_state(self, state: str):
         previous = self._state
         self._state = state
         self.lbl_state.setText(_STATE_TEXT.get(state, state))
-        self._update_controls()
         self.btn_pause.setText('继续' if state == 'paused' else '暂停')
         if state == 'playing':
             self.lbl_state.setStyleSheet('color: #7bd88f; font-weight: 600;')
@@ -542,9 +669,11 @@ class MainWindow(QMainWindow):
             self.lbl_state.setStyleSheet('color: #9aa0a6;')
             if state == 'idle' and previous != 'finished':
                 self.lbl_progress.setText('就绪')
+        self._update_controls()
 
     def _on_progress(self, index: int, total: int, action: str):
         self.lbl_progress.setText(f'第 {index}/{total} 音 · 按 {action}')
+        self._update_mini()
 
     def _refresh_fg_label(self):
         if sys.platform != 'win32':
@@ -563,8 +692,10 @@ class MainWindow(QMainWindow):
         missing = [HOTKEY_LABELS[h] for h in self._hotkeys.failed if h in HOTKEY_LABELS]
         if missing:
             self._append_log('热键注册失败（可能被其他程序占用）：' + '、'.join(missing))
+            if HOTKEY_MINI_WINDOW in self._hotkeys.failed:
+                self._append_log('可在本工具窗口内按 F11 或点击「迷你浮窗」打开小窗')
         else:
-            self._append_log('全局热键就绪：Shift+F9 播放/停止，Shift+F10 暂停/继续，Shift+F8 急停')
+            self._append_log('全局热键就绪：Shift+F9 播放/停止，Shift+F10 暂停/继续，Shift+F8 急停，F11 浮窗')
 
     def _append_log(self, message: str):
         stamp = time.strftime('%H:%M:%S')
@@ -576,8 +707,13 @@ class MainWindow(QMainWindow):
             self._update_controls()
         if self._player and not self._player.stop(timeout=0):
             self.lbl_state.setText('正在停止演奏…')
+            self._update_mini()
             event.ignore()
             QTimer.singleShot(50, self.close)
             return
+        self._save_mini_position()
+        self._mini.hide()
+        self._settings.sync()
         self._hotkeys.stop()
         super().closeEvent(event)
+        self.closed.emit()

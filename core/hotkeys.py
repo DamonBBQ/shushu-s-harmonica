@@ -7,17 +7,20 @@ from typing import Callable
 HOTKEY_START_STOP = 1
 HOTKEY_PAUSE = 2
 HOTKEY_EMERGENCY = 3
+HOTKEY_MINI_WINDOW = 4
 
 HOTKEY_LABELS = {
     HOTKEY_START_STOP: 'Shift+F9',
     HOTKEY_PAUSE: 'Shift+F10',
     HOTKEY_EMERGENCY: 'Shift+F8',
+    HOTKEY_MINI_WINDOW: 'F11',
 }
 
 _VK = {
     HOTKEY_START_STOP: 0x78,
     HOTKEY_PAUSE: 0x79,
     HOTKEY_EMERGENCY: 0x77,
+    HOTKEY_MINI_WINDOW: 0x7A,
 }
 _MOD_SHIFT = 0x0004
 _MOD_NOREPEAT = 0x4000
@@ -51,7 +54,10 @@ class GlobalHotkeys:
 
     @property
     def emergency_ready(self) -> bool:
-        return not self._closing.is_set() and HOTKEY_EMERGENCY in (self._registered or ())
+        return self.is_registered(HOTKEY_EMERGENCY)
+
+    def is_registered(self, hotkey_id: int) -> bool:
+        return not self._closing.is_set() and hotkey_id in (self._registered or ())
 
     def start(self) -> None:
         if not self.available:
@@ -73,7 +79,10 @@ class GlobalHotkeys:
                 return
 
             for hotkey_id, vk in _VK.items():
-                if user32.RegisterHotKey(None, hotkey_id, _MOD_SHIFT | _MOD_NOREPEAT, vk):
+                modifiers = _MOD_NOREPEAT
+                if hotkey_id != HOTKEY_MINI_WINDOW:
+                    modifiers |= _MOD_SHIFT
+                if user32.RegisterHotKey(None, hotkey_id, modifiers, vk):
                     registered.add(hotkey_id)
             self._registered = frozenset(registered)
             self._on_status()
