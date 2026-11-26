@@ -1,11 +1,14 @@
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import mido
 
 from core.mapping import build_play_notes, to_action
 from core.score import ScoreEvent, load_midi, load_score, load_txt
+from core.updater import RemoteScore, ScoreUpdater, UpdateError, git_blob_sha
 
 
 class ScoreTests(unittest.TestCase):
@@ -137,3 +140,121 @@ class PlaybackPlanTests(unittest.TestCase):
         _, manual_only, _ = build_play_notes(events, transpose=12, auto_fit=False)
         self.assertEqual(corrected, 0)
         self.assertEqual(manual_only, 12)
+
+
+class ScoreUpdaterTests(unittest.TestCase):
+    def setUp(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.scores_dir = Path(directory.name)
+        self.updater = ScoreUpdater(self.scores_dir)
+
+    @staticmethod
+    def remote(name: str, data: bytes) -> RemoteScore:
+        return RemoteScore(name=name, blob_sha=git_blob_sha(data), size=len(data))
+
+    def test_check_detects_only_changed_or_missing_scores(self):
+        same_data = b'TITLE=same\nBPM=60\n1 2\n'
+        old_data = b'TITLE=changed\nBPM=60\n1\n'
+        new_data = b'TITLE=changed\nBPM=60\n1 2\n'
+        added_data = b'TITLE=added\nBPM=60\n3 4\n'
+        (self.scores_dir / 'same.txt').write_bytes(same_data)
+        (self.scores_dir / 'changed.txt').write_bytes(old_data)
+        (self.scores_dir / 'custom.txt').write_bytes(b'TITLE=custom\nBPM=60\n5 6\n')
+        remote = (
+            self.remote('same.txt', same_data),
+            self.remote('added.txt', added_data),
+            self.remote('changed.txt', new_data),
+        )
+
+        with patch('core.updater._fetch_remote_scores', return_value=remote):
+            check = self.updater.check_for_updates()
+
+        self.assertEqual(check.total, 3)
+        self.assertEqual([item.name for item in check.updates], ['added.txt', 'changed.txt'])
+
+    def test_windows_crlf_checkout_matches_git_blob(self):
+        data = b'TITLE=same\nBPM=60\n1 2\n'
+        (self.scores_dir / 'same.txt').write_bytes(data.replace(b'\n', b'\r\n'))
+        remote = (self.remote('same.txt', data),)
+
+        with patch('core.updater._fetch_remote_scores', return_value=remote):
+            check = self.updater.check_for_updates()
+
+        self.assertEqual(check.updates, ())
+
+    def test_install_backs_up_replaced_scores_and_keeps_custom_files(self):
+        old_data = b'TITLE=changed\nBPM=60\n1\n'
+        new_data = b'TITLE=changed\nBPM=60\n1 2\n'
+        added_data = b'TITLE=added\nBPM=60\n3 4\n'
+        custom_data = b'TITLE=custom\nBPM=60\n5 6\n'
+        (self.scores_dir / 'changed.txt').write_bytes(old_data)
+        (self.scores_dir / 'custom.txt').write_bytes(custom_data)
+        updates = (
+            self.remote('changed.txt', new_data),
+            self.remote('added.txt', added_data),
+        )
+        progress = []
+
+        with patch.object(self.updater, '_download', side_effect=[new_data, added_data]):
+            result = self.updater.install_updates(updates, lambda *args: progress.append(args))
+
+        self.assertEqual((self.scores_dir / 'changed.txt').read_bytes(), new_data)
+        self.assertEqual((self.scores_dir / 'added.txt').read_bytes(), added_data)
+        self.assertEqual((self.scores_dir / 'custom.txt').read_bytes(), custom_data)
+        self.assertEqual([path.name for path in result.installed], ['changed.txt', 'added.txt'])
+        self.assertIsNotNone(result.backup_dir)
+        self.assertEqual((result.backup_dir / 'changed.txt').read_bytes(), old_data)
+        self.assertEqual(progress, [(1, 2, 'changed.txt'), (2, 2, 'added.txt')])
+
+    def test_checksum_failure_does_not_replace_any_scores(self):
+        old_data = b'TITLE=changed\nBPM=60\n1\n'
+        valid_data = b'TITLE=added\nBPM=60\n3 4\n'
+        broken_data = b'TITLE=changed\nBPM=60\n1 2\n'
+        (self.scores_dir / 'changed.txt').write_bytes(old_data)
+        updates = (
+            self.remote('added.txt', valid_data),
+            self.remote('changed.txt', broken_data),
+        )
+
+        with patch('core.updater._read_url', side_effect=[valid_data, broken_data[:-1] + b'X']):
+            with self.assertRaisesRegex(UpdateError, '校验值不匹配'):
+                self.updater.install_updates(updates)
+
+        self.assertEqual((self.scores_dir / 'changed.txt').read_bytes(), old_data)
+        self.assertFalse((self.scores_dir / 'added.txt').exists())
+
+    def test_unparseable_download_does_not_replace_existing_score(self):
+        old_data = b'TITLE=changed\nBPM=60\n1\n'
+        broken_data = b'not a supported score\n'
+        (self.scores_dir / 'changed.txt').write_bytes(old_data)
+
+        with patch.object(self.updater, '_download', return_value=broken_data):
+            with self.assertRaisesRegex(UpdateError, '无法解析'):
+                self.updater.install_updates((self.remote('changed.txt', broken_data),))
+
+        self.assertEqual((self.scores_dir / 'changed.txt').read_bytes(), old_data)
+
+    def test_replace_failure_rolls_back_earlier_files(self):
+        first_old = b'TITLE=first\nBPM=60\n1\n'
+        first_new = b'TITLE=first\nBPM=60\n1 2\n'
+        second_new = b'TITLE=second\nBPM=60\n3 4\n'
+        (self.scores_dir / 'first.txt').write_bytes(first_old)
+        updates = (
+            self.remote('first.txt', first_new),
+            self.remote('second.txt', second_new),
+        )
+        real_replace = os.replace
+
+        def fail_second(source, target):
+            if Path(target).name == 'second.txt':
+                raise OSError('file is locked')
+            return real_replace(source, target)
+
+        with (patch.object(self.updater, '_download', side_effect=[first_new, second_new]),
+              patch('core.updater.os.replace', side_effect=fail_second)):
+            with self.assertRaisesRegex(UpdateError, '安装曲库更新失败'):
+                self.updater.install_updates(updates)
+
+        self.assertEqual((self.scores_dir / 'first.txt').read_bytes(), first_old)
+        self.assertFalse((self.scores_dir / 'second.txt').exists())

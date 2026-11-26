@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -48,6 +49,7 @@ from core.input_backend import (
 )
 from core.mapping import build_play_notes, describe_action
 from core.score import load_score
+from core.updater import ScoreUpdater
 from ui.mini_window import DEFAULT_OPACITY, MAX_OPACITY, MIN_OPACITY, MiniWindow
 from ui.theme import FOREGROUND_MATCH, FOREGROUND_MUTED, MAIN_WINDOW_STYLE, state_color
 
@@ -76,6 +78,10 @@ class _Bridge(QObject):
     log = Signal(str)
     progress = Signal(int, int, str)
     score_read = Signal(object, object, object)
+    update_progress = Signal(int, int, str)
+    update_checked = Signal(object)
+    update_installed = Signal(object)
+    update_failed = Signal(str)
 
 
 class MainWindow(QMainWindow):
@@ -94,12 +100,17 @@ class MainWindow(QMainWindow):
         self._bridge.log.connect(self._append_log)
         self._bridge.progress.connect(self._on_progress)
         self._bridge.score_read.connect(self._on_score_read)
+        self._bridge.update_progress.connect(self._on_update_progress)
+        self._bridge.update_checked.connect(self._on_update_checked)
+        self._bridge.update_installed.connect(self._on_update_installed)
+        self._bridge.update_failed.connect(self._on_update_failed)
 
         self._player: Player | None = None
         self._player_lock = threading.Lock()
         self._real_playback = False
         self._state = 'idle'
         self._closing = False
+        self._updating = False
         self._score_loading = False
         self._score_cache = OrderedDict()
         self._plan = None
@@ -178,9 +189,18 @@ class MainWindow(QMainWindow):
         self.btn_add.clicked.connect(self._add_score)
         self.btn_refresh = QPushButton('刷新')
         self.btn_refresh.clicked.connect(lambda: self._refresh_scores())
+        self.btn_update = QPushButton('检查更新')
+        self.btn_update.setObjectName('updateButton')
+        self.btn_update.setToolTip('从 GitHub main 分支更新内置曲谱，保留自行添加的曲谱')
+        self.btn_update.clicked.connect(self._check_for_updates)
         row.addWidget(self.btn_add, 1)
         row.addWidget(self.btn_refresh)
+        row.addWidget(self.btn_update)
         left.addLayout(row)
+        self.lbl_update = QLabel('')
+        self.lbl_update.setObjectName('hint')
+        self.lbl_update.setWordWrap(True)
+        left.addWidget(self.lbl_update)
         left.addWidget(self.list_scores, 1)
         details = QFrame()
         details.setObjectName('trackSummary')
@@ -377,7 +397,7 @@ class MainWindow(QMainWindow):
             self._toggle_mini()
 
     def _toggle_mini(self):
-        if self._closing:
+        if self._closing or self._updating:
             return
         if self._mini.isVisible():
             self._restore_main()
@@ -437,6 +457,92 @@ class MainWindow(QMainWindow):
                 self.list_scores.setCurrentRow(selected_row)
         self._sync_mini_library()
         self._update_info()
+
+    def _check_for_updates(self):
+        if (self._closing or self._updating or self._state in _ACTIVE_STATES
+                or (self._player and self._player.active)):
+            return
+        self._updating = True
+        self.lbl_update.setText('正在检查 GitHub 曲库…')
+        self._append_log('正在检查在线曲库…')
+        self._update_controls()
+        threading.Thread(target=self._run_update_check, daemon=True).start()
+
+    def _run_update_check(self):
+        try:
+            check = ScoreUpdater(SCORES_DIR).check_for_updates()
+        except Exception as exc:
+            self._bridge.update_failed.emit(str(exc))
+        else:
+            self._bridge.update_checked.emit(check)
+
+    def _on_update_checked(self, check):
+        if self._closing:
+            return
+        count = len(check.updates)
+        if not count:
+            self._updating = False
+            self.lbl_update.setText(f'已是最新曲库（共检查 {check.total} 个文件）')
+            self._append_log('在线曲库检查完成：已是最新')
+            self._update_controls()
+            QMessageBox.information(self, '检查更新', '当前曲库已是最新。')
+            return
+
+        answer = QMessageBox.question(
+            self,
+            '发现曲库更新',
+            f'发现 {count} 个新增或更新的曲谱，是否下载并安装？\n\n'
+            '远端内置同名谱会被更新，原文件会备份；自行添加且远端没有的曲谱会保留。',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._updating = False
+            self.lbl_update.setText(f'发现 {count} 个更新，已取消')
+            self._append_log(f'已取消曲库更新（发现 {count} 个文件）')
+            self._update_controls()
+            return
+
+        self.lbl_update.setText(f'准备下载 {count} 个更新…')
+        self._append_log(f'开始更新曲库：{count} 个文件')
+        threading.Thread(target=self._run_update_install, args=(check.updates,), daemon=True).start()
+
+    def _run_update_install(self, updates):
+        def report(done: int, total: int, name: str):
+            self._bridge.update_progress.emit(done, total, name)
+
+        try:
+            result = ScoreUpdater(SCORES_DIR).install_updates(updates, report)
+        except Exception as exc:
+            self._bridge.update_failed.emit(str(exc))
+        else:
+            self._bridge.update_installed.emit(result)
+
+    def _on_update_progress(self, done: int, total: int, name: str):
+        self.lbl_update.setText(f'正在下载并校验 {done}/{total}：{name}')
+
+    def _on_update_installed(self, result):
+        if self._closing:
+            return
+        self._updating = False
+        self._score_cache.clear()
+        count = len(result.installed)
+        self.lbl_update.setText(f'曲库已更新（{count} 个文件）')
+        self._append_log(f'曲库更新完成：{count} 个文件')
+        if result.backup_dir is not None:
+            self._append_log(f'被替换的原文件备份在：{result.backup_dir}')
+        self._refresh_scores()
+        self._update_controls()
+        QMessageBox.information(self, '更新完成', f'曲库已更新，共处理 {count} 个文件。')
+
+    def _on_update_failed(self, message: str):
+        if self._closing:
+            return
+        self._updating = False
+        self.lbl_update.setText('更新失败')
+        self._append_log(f'曲库更新失败：{message}')
+        self._update_controls()
+        QMessageBox.warning(self, '更新失败', message)
 
     def _selected_path(self) -> Path | None:
         item = self.list_scores.currentItem()
@@ -555,7 +661,7 @@ class MainWindow(QMainWindow):
         self._import_scores([Path(path) for path in paths])
 
     def _import_scores(self, paths: list[Path]):
-        if not paths or self._closing or self._state in _ACTIVE_STATES:
+        if not paths or self._closing or self._updating or self._state in _ACTIVE_STATES:
             return
         try:
             SCORES_DIR.mkdir(parents=True, exist_ok=True)
@@ -583,18 +689,18 @@ class MainWindow(QMainWindow):
             self._refresh_scores(selected)
 
     def dragEnterEvent(self, event):
-        if not self._closing and self._state not in _ACTIVE_STATES:
+        if not self._closing and not self._updating and self._state not in _ACTIVE_STATES:
             if any(url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() in _SCORE_SUFFIXES
                    for url in event.mimeData().urls()):
                 event.acceptProposedAction()
 
     def dropEvent(self, event):
-        if not self._closing and self._state not in _ACTIVE_STATES:
+        if not self._closing and not self._updating and self._state not in _ACTIVE_STATES:
             self._import_scores([Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()])
             event.acceptProposedAction()
 
     def _start_play(self):
-        if (self._closing or self._pending_mini_score is not None
+        if (self._closing or self._updating or self._pending_mini_score is not None
                 or self._state in _ACTIVE_STATES or (self._player and self._player.active)):
             return
         self._update_info()
@@ -694,16 +800,17 @@ class MainWindow(QMainWindow):
 
     def _update_controls(self):
         active = self._state in _ACTIVE_STATES or (self._player is not None and self._player.active)
-        configurable = not active and not self._closing and self._pending_mini_score is None
+        configurable = (not active and not self._closing and not self._updating
+                        and self._pending_mini_score is None)
         self.btn_play.setEnabled(configurable and self._plan is not None and bool(self._plan[1]))
         self.btn_stop.setEnabled(active and not self._closing)
         self.btn_pause.setEnabled(not self._closing and self._state in ('playing', 'waiting_game', 'paused'))
-        for widget in (self.list_scores, self.btn_add, self.btn_refresh, self.slider_speed,
-                       self.spin_transpose, self.chk_auto_fit, self.chk_loop,
+        for widget in (self.list_scores, self.btn_add, self.btn_refresh, self.btn_update,
+                       self.slider_speed, self.spin_transpose, self.chk_auto_fit, self.chk_loop,
                        self.chk_foreground, self.edit_process):
             widget.setEnabled(configurable)
         self.chk_dry.setEnabled(configurable and sys.platform == 'win32')
-        self.btn_mini.setEnabled(not self._closing)
+        self.btn_mini.setEnabled(not self._closing and not self._updating)
         self.slider_mini_opacity.setEnabled(not self._closing)
         self._update_mini()
 
@@ -775,6 +882,10 @@ class MainWindow(QMainWindow):
         self.txt_log.appendPlainText(f'[{stamp}] {message}')
 
     def closeEvent(self, event):
+        if self._updating:
+            self._append_log('曲库更新尚未结束，请稍候再关闭程序')
+            event.ignore()
+            return
         if not self._closing:
             self._closing = True
             self._update_controls()

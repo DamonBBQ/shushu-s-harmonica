@@ -8,10 +8,11 @@ from unittest.mock import patch
 
 from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtTest import QSignalSpy, QTest
-from PySide6.QtWidgets import QApplication, QListWidget, QPushButton, QSlider
+from PySide6.QtWidgets import QApplication, QListWidget, QMessageBox, QPushButton, QSlider
 
 from core.engine import PlaybackOptions
 from core.input_backend import DryRunBackend
+from core.updater import RemoteScore, UpdateCheck, git_blob_sha
 from ui import main_window
 
 
@@ -166,6 +167,35 @@ class MiniWindowTest(unittest.TestCase):
         self.wait_for(lambda: window._state == 'idle' and window.btn_play.isEnabled())
         self.assertEqual(window.list_scores.currentRow(), 2)
         self.assertFalse(window._player.active)
+
+    def test_check_updates_reports_latest_without_blocking_ui(self):
+        check = UpdateCheck(updates=(), total=3)
+        with (patch.object(main_window.ScoreUpdater, 'check_for_updates', return_value=check),
+              patch.object(main_window.QMessageBox, 'information') as information):
+            self.window.btn_update.click()
+            self.wait_for(lambda: not self.window._updating)
+
+        self.assertTrue(self.window.btn_update.isEnabled())
+        self.assertIn('已是最新', self.window.lbl_update.text())
+        information.assert_called_once()
+
+    def test_update_install_refreshes_library_and_keeps_existing_scores(self):
+        data = 'TITLE=第四首\nBPM=60\n7-- 1\n'.encode('utf-8')
+        remote = RemoteScore(name='d.txt', blob_sha=git_blob_sha(data), size=len(data))
+        check = UpdateCheck(updates=(remote,), total=4)
+        with (patch.object(main_window.ScoreUpdater, 'check_for_updates', return_value=check),
+              patch.object(main_window.ScoreUpdater, '_download', return_value=data),
+              patch.object(main_window.QMessageBox, 'question',
+                           return_value=QMessageBox.StandardButton.Yes),
+              patch.object(main_window.QMessageBox, 'information') as information):
+            self.window.btn_update.click()
+            self.wait_for(lambda: not self.window._updating and self.window.list_scores.count() == 4)
+
+        self.assertEqual(self.window.list_scores.count(), 4)
+        self.assertTrue((main_window.SCORES_DIR / 'd.txt').is_file())
+        self.assertIn('曲库已更新', self.window.lbl_update.text())
+        self.assertTrue(self.window.btn_update.isEnabled())
+        information.assert_called_once()
 
     @staticmethod
     def without_countdown(**options):
