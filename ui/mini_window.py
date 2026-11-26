@@ -4,6 +4,8 @@ from PySide6.QtCore import QPoint, QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QCloseEvent, QGuiApplication, QMouseEvent, QResizeEvent, QScreen
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSizePolicy, QSlider, QVBoxLayout, QWidget
 
+from .theme import MINI_WINDOW_STYLE, state_color
+
 MIN_OPACITY = 35
 MAX_OPACITY = 100
 DEFAULT_OPACITY = 85
@@ -113,31 +115,9 @@ class MiniWindow(QWidget):
         footer.addWidget(self._opacity_value)
         layout.addLayout(footer)
 
-        self.setStyleSheet('''
-            QWidget#miniWindow {
-                background-color: #171d1b; border: 1px solid #3e5147;
-            }
-            QLabel { color: #dce8e1; font-size: 12px; }
-            QLabel#miniTitle { color: #f3f8f5; font-size: 15px; font-weight: 600; }
-            QLabel#miniStatus { color: #9ed9af; font-weight: 600; }
-            QLabel#miniProgress, QLabel#miniOpacityLabel, QLabel#miniOpacityValue { color: #b9c9bf; }
-            QPushButton {
-                color: #e6efe9; background-color: #26322b; border: 1px solid #3b4d42;
-                border-radius: 5px; padding: 4px 7px; font-size: 12px; min-height: 16px;
-            }
-            QPushButton:hover { background-color: #344438; border-color: #607769; }
-            QPushButton:pressed { background-color: #1f2b24; }
-            QPushButton:disabled { color: #7b9084; background-color: #1e2722; border-color: #303e35; }
-            QPushButton#miniAction:enabled { color: #122218; background-color: #9ad7ad; border-color: #b2e4c1; font-weight: 600; }
-            QPushButton#miniAction:hover { background-color: #b2e4c1; }
-            QPushButton#miniAction:pressed { background-color: #7ab890; }
-            QPushButton#miniRestore { padding: 2px 7px; }
-            QSlider::groove:horizontal { height: 4px; border-radius: 2px; background-color: #3c5145; }
-            QSlider::sub-page:horizontal { border-radius: 2px; background-color: #74ae85; }
-            QSlider::handle:horizontal { width: 12px; margin: -4px 0; border-radius: 6px; background-color: #c7ecd4; }
-        ''')
+        self.setStyleSheet(MINI_WINDOW_STYLE)
         self.set_snapshot('', '空闲', '就绪', can_previous=False, can_next=False,
-                          can_play=False, can_pause=False, can_stop=False, paused=False)
+                          can_play=False, can_pause=False, can_stop=False, state='idle')
         self.set_opacity(DEFAULT_OPACITY)
 
     @staticmethod
@@ -149,9 +129,10 @@ class MiniWindow(QWidget):
 
     def set_snapshot(self, title: str, status: str, progress: str, *, can_previous: bool,
                      can_next: bool, can_play: bool, can_pause: bool, can_stop: bool,
-                     paused: bool) -> None:
+                     state: str) -> None:
         self._title.set_full_text(title or '未选曲谱')
         self._status.setText(status)
+        self._status.setStyleSheet(f'color: {state_color(state)};')
         self._progress.set_full_text(progress)
         self._previous.setEnabled(can_previous)
         self._next.setEnabled(can_next)
@@ -160,7 +141,7 @@ class MiniWindow(QWidget):
         self._action.setEnabled(can_play or can_pause)
         action_text = '播放'
         if can_pause:
-            action_text = '继续' if paused else '暂停'
+            action_text = '继续' if state == 'paused' else '暂停'
         self._action.setText(action_text)
 
     def set_opacity(self, percent: int) -> None:

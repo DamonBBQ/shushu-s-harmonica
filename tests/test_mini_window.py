@@ -108,7 +108,8 @@ class MiniWindowTest(unittest.TestCase):
         action = window._mini.findChild(QPushButton, 'miniAction')
         with patch.object(main_window, 'PlaybackOptions', side_effect=self.without_countdown):
             action.click()
-        self.wait_for(lambda: window._state == 'playing')
+        self.wait_for(lambda: window._state == 'playing' and window.track_progress.value() > 0)
+        self.assertEqual(window.track_progress.maximum(), 2)
         player = window._player
         self.assertFalse(window._mini.findChild(QPushButton, 'miniNext').isEnabled())
         action.click()
@@ -121,6 +122,7 @@ class MiniWindowTest(unittest.TestCase):
         self.assertEqual(action.text(), '继续')
         window._mini.findChild(QPushButton, 'miniStop').click()
         self.wait_for(lambda: window._state == 'idle')
+        self.assertEqual(window.track_progress.value(), 0)
 
     @staticmethod
     def without_countdown(**options):

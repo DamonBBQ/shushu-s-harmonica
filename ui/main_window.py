@@ -12,6 +12,7 @@ from PySide6.QtGui import QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -21,7 +22,9 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QVBoxLayout,
@@ -46,6 +49,7 @@ from core.input_backend import (
 from core.mapping import build_play_notes, describe_action
 from core.score import load_score
 from ui.mini_window import DEFAULT_OPACITY, MAX_OPACITY, MIN_OPACITY, MiniWindow
+from ui.theme import FOREGROUND_MATCH, FOREGROUND_MUTED, MAIN_WINDOW_STYLE, state_color
 
 if getattr(sys, 'frozen', False):
     SCORES_DIR = Path(sys.executable).resolve().parent / 'scores'
@@ -80,8 +84,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('三角洲行动 · 口琴自动演奏器')
-        self.resize(920, 620)
-        self.setMinimumSize(860, 560)
+        self.resize(1000, 680)
+        self.setMinimumSize(852, 630)
 
         self._bridge = _Bridge()
         self._bridge.hotkey.connect(self._on_hotkey)
@@ -103,7 +107,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_mini_window()
-        self._apply_theme()
+        self.setStyleSheet(MAIN_WINDOW_STYLE)
         self.setAcceptDrops(True)
         self._refresh_scores()
         self._on_state('idle')
@@ -126,101 +130,156 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         central = QWidget()
+        central.setObjectName('workspace')
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(16, 12, 16, 10)
-        root.setSpacing(10)
+        root.setContentsMargins(20, 18, 20, 14)
+        root.setSpacing(12)
 
-        title_row = QHBoxLayout()
-        title = QLabel('三角洲行动 · 口琴自动演奏器')
+        header = QFrame()
+        header.setObjectName('header')
+        title_row = QHBoxLayout(header)
+        title_row.setContentsMargins(16, 12, 16, 12)
+        title_row.setSpacing(16)
+        titles = QVBoxLayout()
+        titles.setSpacing(3)
+        title = QLabel('口琴自动演奏器')
         title.setObjectName('title')
-        title_row.addWidget(title, 1)
+        subtitle = QLabel('三角洲行动 · MIDI 与简谱 TXT')
+        subtitle.setObjectName('subtitle')
+        titles.addWidget(title)
+        titles.addWidget(subtitle)
+        title_row.addLayout(titles, 1)
         self.btn_mini = QPushButton('迷你浮窗  F11')
+        self.btn_mini.setObjectName('miniLauncher')
         self.btn_mini.setToolTip('切换到置顶浮窗')
         self.btn_mini.clicked.connect(self._toggle_mini)
         title_row.addWidget(self.btn_mini)
-        root.addLayout(title_row)
-        subtitle = QLabel('MIDI / 简谱 TXT → 自动模拟 Z X C V B N M , 与鼠标升降调键')
-        subtitle.setObjectName('subtitle')
-        root.addWidget(subtitle)
+        root.addWidget(header)
 
         body = QHBoxLayout()
-        body.setSpacing(14)
+        body.setSpacing(16)
         root.addLayout(body, 1)
 
-        left = QVBoxLayout()
-        left.setSpacing(8)
-        left.addWidget(QLabel('曲库（scores 目录）'))
+        library = QGroupBox('曲库')
+        library.setObjectName('libraryCard')
+        left = QVBoxLayout(library)
+        left.setSpacing(10)
         self.list_scores = QListWidget()
+        self.list_scores.setObjectName('scoreList')
+        self.list_scores.setAlternatingRowColors(True)
         self.list_scores.currentItemChanged.connect(self._on_score_selected)
         self.list_scores.itemDoubleClicked.connect(lambda *_: self._start_play())
-        left.addWidget(self.list_scores, 1)
         row = QHBoxLayout()
+        row.setSpacing(8)
         self.btn_add = QPushButton('添加曲谱…')
+        self.btn_add.setObjectName('importButton')
         self.btn_add.clicked.connect(self._add_score)
         self.btn_refresh = QPushButton('刷新')
         self.btn_refresh.clicked.connect(lambda: self._refresh_scores())
-        row.addWidget(self.btn_add)
+        row.addWidget(self.btn_add, 1)
         row.addWidget(self.btn_refresh)
         left.addLayout(row)
+        left.addWidget(self.list_scores, 1)
+        details = QFrame()
+        details.setObjectName('trackSummary')
+        details_layout = QVBoxLayout(details)
+        details_layout.setContentsMargins(10, 9, 10, 9)
         self.lbl_info = QLabel('选择一个曲谱')
         self.lbl_info.setObjectName('info')
         self.lbl_info.setWordWrap(True)
-        left.addWidget(self.lbl_info)
-        left.addStretch(0)
-        body.addLayout(left, 5)
+        details_layout.addWidget(self.lbl_info)
+        left.addWidget(details)
+        body.addWidget(library, 4)
 
         right = QVBoxLayout()
         right.setSpacing(10)
-        body.addLayout(right, 6)
+        body.addLayout(right, 7)
 
         controls = QGroupBox('演奏控制')
+        controls.setObjectName('playerCard')
         grid = QGridLayout(controls)
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
+        grid.setColumnMinimumWidth(0, 84)
+        grid.setColumnMinimumWidth(1, 92)
+        grid.setColumnStretch(2, 1)
+
+        playback = QFrame()
+        playback.setObjectName('playbackSummary')
+        playback_layout = QVBoxLayout(playback)
+        playback_layout.setContentsMargins(12, 9, 12, 10)
+        playback_layout.setSpacing(7)
+        playback_header = QHBoxLayout()
+        playback_header.setSpacing(12)
+        self.lbl_track = QLabel('未选曲谱')
+        self.lbl_track.setObjectName('trackTitle')
+        self.lbl_track.setTextFormat(Qt.PlainText)
+        self.lbl_track.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        playback_header.addWidget(self.lbl_track, 1)
+        self.lbl_progress = QLabel('就绪')
+        self.lbl_progress.setObjectName('progress')
+        playback_header.addWidget(self.lbl_progress)
+        playback_layout.addLayout(playback_header)
+        self.track_progress = QProgressBar()
+        self.track_progress.setObjectName('trackProgress')
+        self.track_progress.setAccessibleName('演奏进度')
+        self.track_progress.setRange(0, 1)
+        self.track_progress.setValue(0)
+        self.track_progress.setTextVisible(False)
+        self.track_progress.setFixedHeight(5)
+        playback_layout.addWidget(self.track_progress)
+        grid.addWidget(playback, 0, 0, 1, 3)
+
         self.btn_play = QPushButton('播放')
         self.btn_play.setObjectName('primary')
         self.btn_play.clicked.connect(self._start_play)
         self.btn_pause = QPushButton('暂停')
         self.btn_pause.clicked.connect(self._toggle_pause)
         self.btn_stop = QPushButton('停止')
+        self.btn_stop.setObjectName('stopButton')
         self.btn_stop.clicked.connect(self._stop)
-        grid.addWidget(self.btn_play, 0, 0)
-        grid.addWidget(self.btn_pause, 0, 1)
-        grid.addWidget(self.btn_stop, 0, 2)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        for button in (self.btn_play, self.btn_pause, self.btn_stop):
+            actions.addWidget(button, 1)
+        grid.addLayout(actions, 1, 0, 1, 3)
 
-        grid.addWidget(QLabel('速度'), 1, 0)
+        speed_label = QLabel('速度')
+        grid.addWidget(speed_label, 2, 0)
         speed_row = QHBoxLayout()
+        speed_row.setSpacing(12)
         self.slider_speed = QSlider(Qt.Horizontal)
         self.slider_speed.setRange(50, 200)
         self.slider_speed.setValue(100)
+        self.slider_speed.setAccessibleName(speed_label.text())
         self.lbl_speed = QLabel('100%')
+        self.lbl_speed.setMinimumWidth(self.lbl_speed.fontMetrics().horizontalAdvance('200%'))
+        self.lbl_speed.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.slider_speed.valueChanged.connect(self._on_speed_changed)
         speed_row.addWidget(self.slider_speed)
         speed_row.addWidget(self.lbl_speed)
-        grid.addLayout(speed_row, 1, 1, 1, 2)
+        grid.addLayout(speed_row, 2, 1, 1, 2)
 
-        grid.addWidget(QLabel('移调'), 2, 0)
+        transpose_label = QLabel('移调')
+        grid.addWidget(transpose_label, 3, 0)
         self.spin_transpose = QSpinBox()
         self.spin_transpose.setRange(-12, 12)
         self.spin_transpose.setSuffix(' 半音')
         self.spin_transpose.valueChanged.connect(lambda *_: self._update_info())
-        grid.addWidget(self.spin_transpose, 2, 1)
+        transpose_label.setBuddy(self.spin_transpose)
+        self.spin_transpose.setAccessibleName(transpose_label.text())
+        grid.addWidget(self.spin_transpose, 3, 1)
         flags = QHBoxLayout()
+        flags.setSpacing(12)
         self.chk_auto_fit = QCheckBox('自动移调适配音域')
         self.chk_auto_fit.setChecked(True)
         self.chk_auto_fit.toggled.connect(lambda *_: self._update_info())
         self.chk_loop = QCheckBox('循环')
         flags.addWidget(self.chk_auto_fit)
         flags.addWidget(self.chk_loop)
-        grid.addLayout(flags, 2, 2)
-
-        self.lbl_progress = QLabel('就绪')
-        self.lbl_progress.setObjectName('progress')
-        grid.addWidget(self.lbl_progress, 3, 0, 1, 3)
-        hint = QLabel('热键：Shift+F9 播放/停止 · Shift+F10 暂停/继续 · Shift+F8 急停')
-        hint.setObjectName('hint')
-        grid.addWidget(hint, 4, 0, 1, 3)
+        flags.addStretch(1)
+        grid.addLayout(flags, 3, 2)
 
         opacity_label = QLabel('浮窗不透明度')
         self.slider_mini_opacity = QSlider(Qt.Horizontal)
@@ -231,13 +290,19 @@ class MainWindow(QMainWindow):
         self.lbl_mini_opacity.setMinimumWidth(self.lbl_mini_opacity.fontMetrics().horizontalAdvance('100%'))
         self.lbl_mini_opacity.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         opacity_row = QHBoxLayout()
-        opacity_row.addWidget(opacity_label)
+        opacity_row.setSpacing(12)
         opacity_row.addWidget(self.slider_mini_opacity, 1)
         opacity_row.addWidget(self.lbl_mini_opacity)
-        grid.addLayout(opacity_row, 5, 0, 1, 3)
+        grid.addWidget(opacity_label, 4, 0)
+        grid.addLayout(opacity_row, 4, 1, 1, 2)
+        hint = QLabel('Shift+F9 播放/停止  ·  Shift+F10 暂停/继续  ·  Shift+F8 急停')
+        hint.setObjectName('hint')
+        hint.setWordWrap(True)
+        grid.addWidget(hint, 5, 0, 1, 3)
         right.addWidget(controls)
 
-        safety = QGroupBox('安全设置')
+        safety = QGroupBox('前台与输入')
+        safety.setObjectName('safetyCard')
         sgrid = QGridLayout(safety)
         sgrid.setHorizontalSpacing(10)
         sgrid.setVerticalSpacing(8)
@@ -245,18 +310,23 @@ class MainWindow(QMainWindow):
         self.chk_foreground.setChecked(True)
         self.chk_foreground.setToolTip('窗口失焦时自动暂停，切回游戏后自动继续')
         sgrid.addWidget(self.chk_foreground, 0, 0, 1, 2)
-        sgrid.addWidget(QLabel('游戏进程关键字'), 1, 0)
+        process_label = QLabel('游戏进程关键字')
+        sgrid.addWidget(process_label, 1, 0)
         self.edit_process = QLineEdit('DeltaForce')
         self.edit_process.setToolTip('前台进程名包含此关键字即视为游戏窗口')
+        process_label.setBuddy(self.edit_process)
         sgrid.addWidget(self.edit_process, 1, 1)
         self.chk_dry = QCheckBox('仅测试（不发送按键，只走时间轴）')
         self.chk_dry.setChecked(True)
         sgrid.addWidget(self.chk_dry, 2, 0, 1, 2)
         right.addWidget(safety)
 
-        log_box = QGroupBox('日志')
+        log_box = QGroupBox('运行日志')
+        log_box.setObjectName('logCard')
         log_layout = QVBoxLayout(log_box)
         self.txt_log = QPlainTextEdit()
+        self.txt_log.setObjectName('logText')
+        self.txt_log.setMinimumHeight(54)
         self.txt_log.setReadOnly(True)
         self.txt_log.setMaximumBlockCount(800)
         log_layout.addWidget(self.txt_log)
@@ -343,36 +413,6 @@ class MainWindow(QMainWindow):
             self.raise_()
             self.activateWindow()
 
-    def _apply_theme(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget { background-color: #1b1d21; color: #e6e6e6; font-size: 13px; }
-            QLabel#title { font-size: 20px; font-weight: 600; color: #f2f4f8; }
-            QLabel#subtitle, QLabel#hint, QLabel#info { color: #9aa0a6; font-size: 12px; }
-            QLabel#progress { color: #c8cdd4; font-weight: 600; padding-top: 2px; }
-            QLabel#state { color: #e6e6e6; padding-left: 4px; }
-            QGroupBox { border: 1px solid #33373d; border-radius: 8px; margin-top: 14px; padding: 10px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #b7bec7; }
-            QListWidget, QPlainTextEdit, QLineEdit, QSpinBox {
-                background-color: #26292e; border: 1px solid #3a3f46; border-radius: 6px;
-                padding: 4px 6px; selection-background-color: #2f6f3e;
-            }
-            QPushButton {
-                background-color: #34383f; border: 1px solid #454b54; border-radius: 6px;
-                padding: 7px 16px;
-            }
-            QPushButton:hover { background-color: #3d424a; }
-            QPushButton:pressed { background-color: #2e3238; }
-            QPushButton:disabled { color: #6d727a; background-color: #26292e; }
-            QPushButton#primary { background-color: #2e7d46; border-color: #3c9a58; }
-            QPushButton#primary:hover { background-color: #358f51; }
-            QPushButton#primary:disabled { background-color: #2a3a2f; border-color: #2f4436; color: #6f8a79; }
-            QSlider::groove:horizontal { height: 4px; background: #3a3f46; border-radius: 2px; }
-            QSlider::handle:horizontal { width: 14px; margin: -6px 0; border-radius: 7px; background: #5aa874; }
-            QCheckBox { spacing: 6px; }
-            QStatusBar { border-top: 1px solid #2a2d31; }
-            QStatusBar QLabel { padding: 2px 8px; }
-        """)
-
     def _refresh_scores(self, selected: Path | None = None):
         selected = selected or self._selected_path()
         with QSignalBlocker(self.list_scores):
@@ -412,6 +452,7 @@ class MainWindow(QMainWindow):
 
     def _on_score_selected(self):
         self.lbl_progress.setText('就绪')
+        self.track_progress.setValue(0)
         self._update_info()
 
     def _update_info(self):
@@ -641,6 +682,8 @@ class MainWindow(QMainWindow):
         row = self.list_scores.currentRow()
         item = self.list_scores.currentItem()
         title = self._plan[0].name if self._plan is not None else (item.text() if item else '')
+        self.lbl_track.setText(title or '未选曲谱')
+        self.lbl_track.setToolTip(title)
         can_select = item is not None and self.list_scores.isEnabled()
         progress = self.lbl_progress.text() if self._plan is not None else self.lbl_info.text()
         self._mini.set_snapshot(
@@ -650,41 +693,41 @@ class MainWindow(QMainWindow):
             can_play=self.btn_play.isEnabled(),
             can_pause=self.btn_pause.isEnabled(),
             can_stop=self.btn_stop.isEnabled(),
-            paused=self._state == 'paused',
+            state=self._state,
         )
 
     def _on_state(self, state: str):
         previous = self._state
         self._state = state
         self.lbl_state.setText(_STATE_TEXT.get(state, state))
+        self.lbl_state.setStyleSheet(f'color: {state_color(state)};')
         self.btn_pause.setText('继续' if state == 'paused' else '暂停')
-        if state == 'playing':
-            self.lbl_state.setStyleSheet('color: #7bd88f; font-weight: 600;')
-        elif state in ('paused', 'waiting_game'):
-            self.lbl_state.setStyleSheet('color: #e0b356; font-weight: 600;')
-        elif state == 'finished':
-            self.lbl_state.setStyleSheet('color: #7bd88f;')
+        if state == 'finished':
             self.lbl_progress.setText('演奏完成')
-        else:
-            self.lbl_state.setStyleSheet('color: #9aa0a6;')
-            if state == 'idle' and previous != 'finished':
-                self.lbl_progress.setText('就绪')
+            self.track_progress.setValue(self.track_progress.maximum())
+        elif state == 'countdown':
+            self.track_progress.setValue(0)
+        elif state == 'idle' and previous != 'finished':
+            self.lbl_progress.setText('就绪')
+            self.track_progress.setValue(0)
         self._update_controls()
 
     def _on_progress(self, index: int, total: int, action: str):
         self.lbl_progress.setText(f'第 {index}/{total} 音 · 按 {action}')
+        self.track_progress.setRange(0, total)
+        self.track_progress.setValue(index)
         self._update_mini()
 
     def _refresh_fg_label(self):
         if sys.platform != 'win32':
             self.lbl_fg.setText('前台进程: (仅 Windows 可检测)')
-            self.lbl_fg.setStyleSheet('color: #9aa0a6;')
+            self.lbl_fg.setStyleSheet(f'color: {FOREGROUND_MUTED};')
             return
         name = foreground_process_name() or '-'
         keyword = self.edit_process.text().strip().lower()
         matched = bool(keyword) and keyword in name.lower()
         self.lbl_fg.setText(f'前台进程: {name}' + ('（关键字匹配）' if matched else ''))
-        self.lbl_fg.setStyleSheet('color: #7bd88f;' if matched else 'color: #9aa0a6;')
+        self.lbl_fg.setStyleSheet(f'color: {FOREGROUND_MATCH if matched else FOREGROUND_MUTED};')
 
     def _report_hotkey_status(self):
         if self._closing or not self._hotkeys.registration_finished:
