@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from math import isfinite
 from pathlib import Path
 
 import mido
 
 _NOTE_OFFSETS = (0, 2, 4, 5, 7, 9, 11)
-_TXT_TOKEN = re.compile(r'([b#^]*)([0-9]|i)(-*)', re.IGNORECASE)
+_TXT_TOKEN = re.compile(r'([b#^]*)([0-8i])(-*)', re.IGNORECASE)
+_CHORD_WINDOW = 0.03
 
 
 @dataclass
@@ -16,6 +18,7 @@ class ScoreEvent:
     start: float
     duration: float
     velocity: int = 80
+    alternatives: tuple[ScoreEvent, ...] = field(default=(), repr=False)
 
 
 @dataclass
@@ -37,53 +40,67 @@ def load_midi(path: str | Path) -> Score:
     mid = mido.MidiFile(str(path))
     if mid.type == 2:
         raise ValueError('不支持 type 2（异步多轨）MIDI 文件')
+    if mid.ticks_per_beat <= 0:
+        raise ValueError('不支持使用 SMPTE 时间基准的 MIDI 文件')
 
-    active: dict[tuple[int, int], tuple[float, int]] = {}
+    # 共享 tempo 时间轴，同时保留轨道编号，避免跨轨配对同频道的同音高。
+    timeline = []
+    end_tick = 0
+    for track_index, track in enumerate(mid.tracks):
+        tick = 0
+        for msg in track:
+            tick += msg.time
+            if msg.type == 'set_tempo' or (
+                msg.type in ('note_on', 'note_off') and msg.channel != 9
+            ):
+                timeline.append((tick, track_index, msg))
+        end_tick = max(end_tick, tick)
+    timeline.sort(key=lambda item: item[0])
+
+    active: dict[tuple[int, int, int], tuple[float, int]] = {}
     raw: list[ScoreEvent] = []
+    tempo = 500_000
+    previous_tick = 0
     now = 0.0
 
-    for msg in mid:
-        now += msg.time
-        if msg.type not in ('note_on', 'note_off') or msg.channel == 9:
+    for tick, track_index, msg in timeline:
+        now += mido.tick2second(tick - previous_tick, mid.ticks_per_beat, tempo)
+        previous_tick = tick
+        if msg.type == 'set_tempo':
+            tempo = msg.tempo
             continue
-        key = (msg.channel, msg.note)
+        key = (track_index, msg.channel, msg.note)
+        previous_note = active.pop(key, None)
+        if previous_note is not None:
+            start, velocity = previous_note
+            raw.append(ScoreEvent(msg.note, start, now - start, velocity))
         if msg.type == 'note_on' and msg.velocity > 0:
-            if key in active:
-                start, velocity = active.pop(key)
-                raw.append(ScoreEvent(msg.note, start, max(now - start, 0.02), velocity))
             active[key] = (now, msg.velocity)
-        elif key in active:
-            start, velocity = active.pop(key)
-            raw.append(ScoreEvent(msg.note, start, max(now - start, 0.02), velocity))
 
-    for (_, note), (start, velocity) in active.items():
+    for (_, _, note), (start, velocity) in active.items():
         raw.append(ScoreEvent(note, start, 0.5, velocity))
 
     if not raw:
         raise ValueError('MIDI 中没有可用音符（已忽略打击乐通道）')
 
-    mono = _to_monophonic(raw)
-    length = max(e.start + e.duration for e in mono)
-    return Score(name=path.stem, events=mono, length=length)
+    track_end = now + mido.tick2second(end_tick - previous_tick, mid.ticks_per_beat, tempo)
+    length = max(track_end, max(event.start + event.duration for event in raw))
+    return Score(name=path.stem, events=_group_chords(raw), length=length)
 
 
-def _to_monophonic(events: list[ScoreEvent]) -> list[ScoreEvent]:
-    events.sort(key=lambda e: (e.start, -e.pitch))
-    result: list[ScoreEvent] = []
-    prev: ScoreEvent | None = None
-    i = 0
-    while i < len(events):
-        j = i
-        cluster_start = events[i].start
-        while j + 1 < len(events) and events[j + 1].start - cluster_start < 0.03:
-            j += 1
-        note = max(events[i:j + 1], key=lambda e: e.pitch)
-        if prev is not None and prev.start + prev.duration > note.start:
-            prev.duration = max(note.start - prev.start, 0.02)
-        result.append(note)
-        prev = note
-        i = j + 1
-    return result
+def _group_chords(events: list[ScoreEvent]) -> list[ScoreEvent]:
+    events.sort(key=lambda event: event.start)
+    groups: list[ScoreEvent] = []
+    first = 0
+    while first < len(events):
+        end = first + 1
+        while end < len(events) and events[end].start - events[first].start < _CHORD_WINDOW:
+            end += 1
+        primary, *alternatives = sorted(events[first:end], key=lambda event: -event.pitch)
+        primary.alternatives = tuple(alternatives)
+        groups.append(primary)
+        first = end
+    return groups
 
 
 def load_txt(path: str | Path) -> Score:
@@ -91,49 +108,54 @@ def load_txt(path: str | Path) -> Score:
     text = path.read_text(encoding='utf-8-sig')
     title = path.stem
     bpm = 100
-    body: list[str] = []
+    body: list[tuple[int, str]] = []
 
-    for raw in text.splitlines():
+    for line_number, raw in enumerate(text.splitlines(), 1):
         line = raw.split('//', 1)[0].strip()
         if not line:
             continue
-        upper = line.upper()
-        if upper.startswith('TITLE'):
-            title = line.split('=', 1)[-1].strip() or title
-        elif upper.startswith('BPM'):
+        header, equals, value = line.partition('=')
+        header = header.strip().upper()
+        if equals and header == 'TITLE':
+            title = value.strip() or title
+        elif equals and header == 'BPM':
             try:
-                bpm = int(round(float(line.split('=', 1)[-1].strip())))
-            except ValueError:
-                pass
+                tempo_value = float(value.strip())
+            except ValueError as exc:
+                raise ValueError(f'第 {line_number} 行的 BPM 必须是数字') from exc
+            if not isfinite(tempo_value):
+                raise ValueError(f'第 {line_number} 行的 BPM 必须是有限数字')
+            bpm = round(max(20, min(300, tempo_value)))
+        elif re.match(r'@format(?:\s|=|$)', line, re.IGNORECASE):
+            raise ValueError(f'第 {line_number} 行声明了暂不支持的 @format 曲谱，请导入 MIDI 或基本简谱 TXT')
+        elif '键位标记' in line or re.match(r'小节\s+\d+\s*\(', line):
+            raise ValueError(f'第 {line_number} 行识别到 Dr-hydra 键位谱，请从曲谱库导出 MIDI 后导入')
         else:
-            body.append(line)
+            body.append((line_number, line))
 
-    bpm = max(20, min(300, bpm))
     beat = 60.0 / bpm
     cursor = 0.0
     events: list[ScoreEvent] = []
-    last_kind = ''
     last_event: ScoreEvent | None = None
 
-    for line in body:
+    for line_number, line in body:
         for token in line.replace('|', ' ').split():
-            if not token:
-                continue
             if set(token) == {'-'}:
-                count = len(token)
-                if last_kind == 'note' and last_event is not None:
-                    last_event.duration += count * beat
-                if last_kind in ('note', 'rest'):
-                    cursor += count * beat
+                if cursor == 0:
+                    raise ValueError(f'第 {line_number} 行的 {token!r} 前需要有音符或休止符')
+                extension = len(token) * beat
+                if last_event is not None:
+                    last_event.duration += extension
+                cursor += extension
                 continue
             match = _TXT_TOKEN.fullmatch(token)
             if not match:
-                continue
-            prefix, symbol, trailing = match.group(1).lower(), match.group(2).lower(), match.group(3)
+                raise ValueError(f'第 {line_number} 行含有无法识别的记号 {token!r}')
+            prefix, symbol, trailing = match.groups()
+            prefix, symbol = prefix.lower(), symbol.lower()
             beats = 1 + len(trailing)
             if symbol == '0':
                 cursor += beats * beat
-                last_kind = 'rest'
                 last_event = None
                 continue
             is_high_do = symbol in ('8', 'i')
@@ -143,11 +165,9 @@ def load_txt(path: str | Path) -> Score:
             event = ScoreEvent(pitch=pitch, start=cursor, duration=beats * beat)
             events.append(event)
             cursor += beats * beat
-            last_kind = 'note'
             last_event = event
 
     if not events:
         raise ValueError('TXT 中没有可解析的音符（支持 1-7、8/i、b 降调、^ 升调、# 半音、0 休止、- 延长）')
 
-    events.sort(key=lambda e: e.start)
     return Score(name=title, events=events, length=cursor)

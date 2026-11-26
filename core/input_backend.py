@@ -10,6 +10,12 @@ KEY_SCANCODES = (0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33)
 class InputBackend:
     name = 'base'
 
+    def begin_session(self) -> None:
+        pass
+
+    def end_session(self) -> None:
+        pass
+
     def key_down(self, key_index: int) -> None:
         raise NotImplementedError
 
@@ -89,6 +95,7 @@ if sys.platform == 'win32':
 
     _user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
     _user32.SendInput.restype = wintypes.UINT
+    _user32.GetForegroundWindow.argtypes = ()
     _user32.GetForegroundWindow.restype = wintypes.HWND
     _user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
     _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
@@ -123,7 +130,21 @@ if sys.platform == 'win32':
         def __init__(self):
             self._held_keys: set[int] = set()
             self._held_buttons: set[str] = set()
-            _winmm.timeBeginPeriod(1)
+            self._high_resolution = False
+            self._target_window: tuple[int, int] | None = None
+            self._checked_window: tuple[int, int] | None = None
+            self._checked_name = ''
+
+        def begin_session(self) -> None:
+            self._target_window = None
+            self._checked_window = None
+            self._checked_name = ''
+            self._high_resolution = _winmm.timeBeginPeriod(1) == 0
+
+        def end_session(self) -> None:
+            if self._high_resolution:
+                _winmm.timeEndPeriod(1)
+                self._high_resolution = False
 
         def _key(self, key_index: int, up: bool) -> None:
             flags = _KEYEVENTF_SCANCODE | (_KEYEVENTF_KEYUP if up else 0)
@@ -137,6 +158,8 @@ if sys.platform == 'win32':
             self._held_keys.add(key_index)
 
         def key_up(self, key_index: int) -> None:
+            if key_index not in self._held_keys:
+                return
             self._key(key_index, True)
             self._held_keys.discard(key_index)
 
@@ -152,32 +175,51 @@ if sys.platform == 'win32':
             self._held_buttons.add(button)
 
         def mouse_up(self, button: str) -> None:
+            if button not in self._held_buttons:
+                return
             self._button(button, True)
             self._held_buttons.discard(button)
 
         def release_all(self) -> None:
-            for key_index in list(self._held_keys):
+            errors = []
+            for key_index in tuple(self._held_keys):
                 try:
                     self.key_up(key_index)
-                except Exception:
-                    pass
-            for button in list(self._held_buttons):
+                except Exception as exc:
+                    errors.append(str(exc))
+            for button in tuple(self._held_buttons):
                 try:
                     self.mouse_up(button)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    errors.append(str(exc))
+            if errors:
+                raise RuntimeError(errors[0])
 
         def foreground_matches(self, keyword: str) -> bool:
             keyword = keyword.strip().lower()
-            return bool(keyword) and keyword in foreground_process_name().lower()
+            window = _foreground_window()
+            if window is None or not keyword:
+                return False
+            if self._target_window is not None:
+                return window == self._target_window
+            if window != self._checked_window:
+                self._checked_name = _process_name(window[1]).lower()
+                self._checked_window = window if self._checked_name else None
+            if keyword in self._checked_name:
+                self._target_window = window
+                return True
+            return False
 
-    def foreground_process_name() -> str:
+    def _foreground_window() -> tuple[int, int] | None:
         hwnd = _user32.GetForegroundWindow()
         if not hwnd:
-            return ''
+            return None
         pid = wintypes.DWORD(0)
         _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        process = _kernel32.OpenProcess(0x1000, False, pid.value)
+        return (hwnd, pid.value) if pid.value else None
+
+    def _process_name(pid: int) -> str:
+        process = _kernel32.OpenProcess(0x1000, False, pid)
         if not process:
             return ''
         try:
@@ -188,6 +230,10 @@ if sys.platform == 'win32':
             return ''
         finally:
             _kernel32.CloseHandle(process)
+
+    def foreground_process_name() -> str:
+        window = _foreground_window()
+        return _process_name(window[1]) if window else ''
 
     def is_process_elevated() -> bool:
         try:

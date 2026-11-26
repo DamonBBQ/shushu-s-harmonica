@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import shutil
 import sys
+import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -48,6 +50,7 @@ else:
     SCORES_DIR = Path(__file__).resolve().parent.parent / 'scores'
 
 _ACTIVE_STATES = ('countdown', 'playing', 'paused', 'waiting_game')
+_SCORE_SUFFIXES = ('.mid', '.midi', '.txt')
 
 _STATE_TEXT = {
     'idle': '空闲',
@@ -61,9 +64,11 @@ _STATE_TEXT = {
 
 class _Bridge(QObject):
     hotkey = Signal(int)
+    hotkey_status = Signal()
     state = Signal(str)
     log = Signal(str)
     progress = Signal(int, int, str)
+    score_read = Signal(object, object, object)
 
 
 class MainWindow(QMainWindow):
@@ -75,21 +80,29 @@ class MainWindow(QMainWindow):
 
         self._bridge = _Bridge()
         self._bridge.hotkey.connect(self._on_hotkey)
+        self._bridge.hotkey_status.connect(self._report_hotkey_status)
         self._bridge.state.connect(self._on_state)
         self._bridge.log.connect(self._append_log)
         self._bridge.progress.connect(self._on_progress)
+        self._bridge.score_read.connect(self._on_score_read)
 
         self._player: Player | None = None
+        self._player_lock = threading.Lock()
+        self._real_playback = False
         self._state = 'idle'
+        self._closing = False
+        self._score_loading = False
+        self._score_cache = OrderedDict()
+        self._plan = None
 
         self._build_ui()
         self._apply_theme()
+        self.setAcceptDrops(True)
         self._refresh_scores()
         self._on_state('idle')
 
-        self._hotkeys = GlobalHotkeys(self._bridge.hotkey.emit)
+        self._hotkeys = GlobalHotkeys(self._dispatch_hotkey, self._hotkey_status_changed)
         self._hotkeys.start()
-        QTimer.singleShot(700, self._report_hotkey_status)
 
         if sys.platform != 'win32':
             self._append_log('当前系统不是 Windows：仅支持「仅测试」模式，全局热键不可用')
@@ -133,7 +146,7 @@ class MainWindow(QMainWindow):
         self.btn_add = QPushButton('添加曲谱…')
         self.btn_add.clicked.connect(self._add_score)
         self.btn_refresh = QPushButton('刷新')
-        self.btn_refresh.clicked.connect(self._refresh_scores)
+        self.btn_refresh.clicked.connect(lambda: self._refresh_scores())
         row.addWidget(self.btn_add)
         row.addWidget(self.btn_refresh)
         left.addLayout(row)
@@ -169,7 +182,7 @@ class MainWindow(QMainWindow):
         self.slider_speed.setRange(50, 200)
         self.slider_speed.setValue(100)
         self.lbl_speed = QLabel('100%')
-        self.slider_speed.valueChanged.connect(lambda v: self.lbl_speed.setText(f'{v}%'))
+        self.slider_speed.valueChanged.connect(self._on_speed_changed)
         speed_row.addWidget(self.slider_speed)
         speed_row.addWidget(self.lbl_speed)
         grid.addLayout(speed_row, 1, 1, 1, 2)
@@ -210,10 +223,8 @@ class MainWindow(QMainWindow):
         self.edit_process.setToolTip('前台进程名包含此关键字即视为游戏窗口')
         sgrid.addWidget(self.edit_process, 1, 1)
         self.chk_dry = QCheckBox('仅测试（不发送按键，只走时间轴）')
+        self.chk_dry.setChecked(True)
         sgrid.addWidget(self.chk_dry, 2, 0, 1, 2)
-        if sys.platform != 'win32':
-            self.chk_dry.setChecked(True)
-            self.chk_dry.setEnabled(False)
         right.addWidget(safety)
 
         log_box = QGroupBox('日志')
@@ -266,22 +277,29 @@ class MainWindow(QMainWindow):
             QStatusBar QLabel { padding: 2px 8px; }
         """)
 
-    def _refresh_scores(self):
-        self.list_scores.clear()
-        if SCORES_DIR.is_dir():
-            files = sorted(
-                (p for p in SCORES_DIR.iterdir()
-                 if p.suffix.lower() in ('.mid', '.midi', '.txt')),
-                key=lambda p: p.name.lower())
+    def _refresh_scores(self, selected: Path | None = None):
+        selected = selected or self._selected_path()
+        with QSignalBlocker(self.list_scores):
+            self.list_scores.clear()
+            try:
+                files = sorted(
+                    (path for path in SCORES_DIR.iterdir()
+                     if path.suffix.lower() in _SCORE_SUFFIXES and path.is_file()),
+                    key=lambda path: path.name.lower()) if SCORES_DIR.is_dir() else []
+            except OSError as exc:
+                self._append_log(f'读取曲库失败：{exc}')
+                files = []
+            selected_row = 0
             for path in files:
+                if path == selected:
+                    selected_row = self.list_scores.count()
                 item = QListWidgetItem(path.stem)
                 item.setData(Qt.UserRole, str(path))
                 item.setToolTip(str(path))
                 self.list_scores.addItem(item)
-        if self.list_scores.count():
-            self.list_scores.setCurrentRow(0)
-        else:
-            self.lbl_info.setText('scores 目录还没有曲谱，点击「添加曲谱…」导入 MIDI 或简谱 TXT')
+            if files:
+                self.list_scores.setCurrentRow(selected_row)
+        self._update_info()
 
     def _selected_path(self) -> Path | None:
         item = self.list_scores.currentItem()
@@ -290,119 +308,174 @@ class MainWindow(QMainWindow):
         return Path(item.data(Qt.UserRole))
 
     def _update_info(self):
+        self._plan = None
+        try:
+            self._prepare_score()
+        finally:
+            self._update_controls()
+
+    def _prepare_score(self):
+        if self._closing:
+            return
         path = self._selected_path()
         if path is None:
-            self.lbl_info.setText('选择一个曲谱')
+            self.lbl_info.setText('曲库为空，可添加或拖入 MIDI 和简谱 TXT')
             return
         try:
-            score = load_score(path)
-            _, applied, dropped = build_play_notes(
-                score.events, self.spin_transpose.value(), self.chk_auto_fit.isChecked())
-        except Exception as exc:
+            stat = path.stat()
+        except OSError as exc:
+            self.lbl_info.setText(f'无法读取曲谱：{exc}')
+            return
+        key = (path, stat.st_mtime_ns, stat.st_size)
+        if key not in self._score_cache:
+            self.lbl_info.setText('正在解析曲谱…')
+            if not self._score_loading:
+                self._score_loading = True
+                threading.Thread(target=self._read_score, args=(key,), daemon=True).start()
+            return
+        self._score_cache.move_to_end(key)
+        score, error = self._score_cache[key]
+        if error is not None:
+            self.lbl_info.setText(f'无法解析：{error}')
+            return
+        speed = self.slider_speed.value() / 100.0
+        try:
+            notes, applied, dropped = build_play_notes(
+                score.events, self.spin_transpose.value(), self.chk_auto_fit.isChecked(), speed=speed)
+        except (ValueError, ArithmeticError) as exc:
             self.lbl_info.setText(f'无法解析：{exc}')
             return
-        parts = [f'音符 {len(score.events)}', f'时长 {score.length:.1f}s', f'移调 {applied:+d} 半音']
+        self._plan = (score, notes, applied, dropped)
+        parts = [f'可演奏 {len(notes)}/{len(score.events)} 音',
+                 f'时长 {score.length / speed:.1f}s', f'移调 {applied:+d} 半音']
         if dropped:
             parts.append(f'过短跳过 {dropped}')
         self.lbl_info.setText(' · '.join(parts))
 
-    def _add_score(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, '选择曲谱', '', '曲谱文件 (*.mid *.midi *.txt)')
-        if not path:
-            return
-        src = Path(path)
-        SCORES_DIR.mkdir(parents=True, exist_ok=True)
-        dest = SCORES_DIR / src.name
+    def _read_score(self, key):
         try:
-            if src.resolve() != dest.resolve():
+            score, error = load_score(key[0]), None
+        except Exception as exc:
+            score, error = None, str(exc)
+        if not self._closing:
+            self._bridge.score_read.emit(key, score, error)
+
+    def _on_score_read(self, key, score, error):
+        self._score_loading = False
+        if self._closing:
+            return
+        self._score_cache[key] = (score, error)
+        if len(self._score_cache) > 8:
+            self._score_cache.popitem(last=False)
+        self._update_info()
+
+    def _on_speed_changed(self, value: int):
+        self.lbl_speed.setText(f'{value}%')
+        self._update_info()
+
+    def _add_score(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, '选择曲谱', '', '曲谱文件 (*.mid *.midi *.txt)')
+        self._import_scores([Path(path) for path in paths])
+
+    def _import_scores(self, paths: list[Path]):
+        if not paths or self._closing or self._state in _ACTIVE_STATES:
+            return
+        try:
+            SCORES_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._append_log(f'无法创建曲库目录：{exc}')
+            return
+        selected = None
+        for src in paths:
+            if src.suffix.lower() not in _SCORE_SUFFIXES or not src.is_file():
+                continue
+            dest = SCORES_DIR / src.name
+            try:
+                if src.resolve() == dest.resolve():
+                    selected = dest
+                    continue
                 if dest.exists():
                     self._append_log(f'曲库中已存在同名文件：{dest.name}，未覆盖')
                 else:
                     shutil.copy2(src, dest)
                     self._append_log(f'已添加曲谱：{dest.name}')
-        except OSError as exc:
-            self._append_log(f'添加曲谱失败：{exc}')
-            return
-        self._refresh_scores()
-        for row in range(self.list_scores.count()):
-            item = self.list_scores.item(row)
-            if Path(item.data(Qt.UserRole)).name == dest.name:
-                self.list_scores.setCurrentRow(row)
-                break
+                selected = dest
+            except OSError as exc:
+                self._append_log(f'添加曲谱失败：{exc}')
+        if selected is not None:
+            self._refresh_scores(selected)
+
+    def dragEnterEvent(self, event):
+        if not self._closing and self._state not in _ACTIVE_STATES:
+            if any(url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() in _SCORE_SUFFIXES
+                   for url in event.mimeData().urls()):
+                event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        if not self._closing and self._state not in _ACTIVE_STATES:
+            self._import_scores([Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()])
+            event.acceptProposedAction()
 
     def _start_play(self):
-        if self._player and self._player.active:
+        if self._closing or self._state in _ACTIVE_STATES or (self._player and self._player.active):
             return
-        path = self._selected_path()
-        if path is None:
-            self._append_log('请先在曲库中选择一个曲谱')
+        self._update_info()
+        if self._plan is None:
+            self._append_log(self.lbl_info.text())
             return
-        try:
-            score = load_score(path)
-            notes, applied, dropped = build_play_notes(
-                score.events, self.spin_transpose.value(), self.chk_auto_fit.isChecked())
-        except Exception as exc:
-            self._append_log(f'曲谱解析失败：{exc}')
-            return
+        score, notes, applied, dropped = self._plan
         if not notes:
-            self._append_log('曲谱中没有可演奏的音符（可能都短于游戏最小时长）')
+            self._append_log('当前速度下没有可演奏的音符，请降低速度或检查曲谱')
             return
 
         dry = self.chk_dry.isChecked() or sys.platform != 'win32'
-        if not dry and HOTKEY_EMERGENCY in self._hotkeys.failed:
-            self._append_log('急停热键 Shift+F8 注册失败，为避免无法停止，已阻止演奏')
-            return
-
-        if dry:
-            backend = DryRunBackend()
-            self._append_log('仅测试模式：只走时间轴，不会发送任何按键')
-        else:
-            try:
-                backend = create_backend(self._bridge.log.emit)
-            except Exception as exc:
-                self._append_log(f'初始化输入后端失败：{exc}')
-                return
-            self._append_log('已启用 Windows 输入后端（SendInput）')
-
         require_fg = self.chk_foreground.isChecked() and not dry
         keyword = self.edit_process.text().strip()
         if require_fg and not keyword:
-            require_fg = False
-            self._append_log('游戏进程关键字为空，已临时关闭前台检测')
-        cache = [0.0, True]
-
-        def foreground_ok() -> bool:
-            if not require_fg:
-                return True
-            now = time.perf_counter()
-            if now - cache[0] >= 0.15:
-                cache[0] = now
-                cache[1] = keyword.lower() in foreground_process_name().lower()
-            return cache[1]
+            self._append_log('启用前台保护时需要填写游戏进程关键字')
+            return
 
         def on_progress(index: int, total: int, note) -> None:
             self._bridge.progress.emit(index, total, describe_action(note))
 
-        self._player = Player(
-            backend,
-            self._bridge.state.emit,
-            self._bridge.log.emit,
-            foreground_ok=foreground_ok,
-            on_progress=on_progress,
-        )
         opts = PlaybackOptions(
             speed=self.slider_speed.value() / 100.0,
             loop=self.chk_loop.isChecked(),
             countdown=3.0,
             require_foreground=require_fg,
+            score_length=score.length,
         )
+        with self._player_lock:
+            if not dry and not self._hotkeys.emergency_ready:
+                reason = '急停热键 Shift+F8 不可用' if self._hotkeys.registration_finished else '正在注册急停热键'
+                self._append_log(f'{reason}，可先使用「仅测试」模式')
+                return
+            try:
+                backend = DryRunBackend() if dry else create_backend(self._bridge.log.emit)
+            except Exception as exc:
+                self._append_log(f'初始化输入后端失败：{exc}')
+                return
+            self._player = Player(
+                backend,
+                self._bridge.state.emit,
+                self._bridge.log.emit,
+                foreground_ok=lambda: backend.foreground_matches(keyword),
+                on_progress=on_progress,
+            )
+            self._real_playback = not dry
+            if not self._player.play(notes, opts):
+                self._real_playback = False
+                self._append_log('启动失败：播放器仍在退出中，请稍后再试')
+                return
+
+        self.lbl_progress.setText('准备演奏…')
+        self._on_state('countdown')
+        self._append_log('仅测试模式：只走时间轴' if dry else '已启用 Windows 输入后端（SendInput）')
         summary = f'开始演奏《{score.name}》 · {len(notes)} 个音 · 移调 {applied:+d} 半音 · 速度 {self.slider_speed.value()}%'
         if dropped:
             summary += f' · 过短跳过 {dropped} 个'
         self._append_log(summary)
-        if not self._player.play(notes, opts):
-            self._append_log('启动失败：播放器仍在退出中，请稍后再试')
 
     def _toggle_pause(self):
         if self._player and self._state in ('playing', 'waiting_game', 'paused'):
@@ -410,9 +483,28 @@ class MainWindow(QMainWindow):
 
     def _stop(self):
         if self._player:
-            self._player.stop()
+            self._player.request_stop()
+
+    def _dispatch_hotkey(self, hotkey_id: int):
+        if hotkey_id == HOTKEY_EMERGENCY:
+            with self._player_lock:
+                if self._player and self._player.active:
+                    self._player.request_stop()
+                    self._bridge.log.emit('急停')
+        else:
+            self._bridge.hotkey.emit(hotkey_id)
+
+    def _hotkey_status_changed(self):
+        with self._player_lock:
+            if (self._real_playback and self._player and self._player.active
+                    and not self._hotkeys.emergency_ready):
+                self._player.request_stop()
+                self._bridge.log.emit('急停热键已失效，正在停止演奏')
+        self._bridge.hotkey_status.emit()
 
     def _on_hotkey(self, hotkey_id: int):
+        if self._closing:
+            return
         if hotkey_id == HOTKEY_START_STOP:
             if self._state in _ACTIVE_STATES:
                 self._stop()
@@ -420,18 +512,24 @@ class MainWindow(QMainWindow):
                 self._start_play()
         elif hotkey_id == HOTKEY_PAUSE:
             self._toggle_pause()
-        elif hotkey_id == HOTKEY_EMERGENCY:
-            if self._state in _ACTIVE_STATES:
-                self._append_log('急停')
-            self._stop()
+
+    def _update_controls(self):
+        active = self._state in _ACTIVE_STATES or (self._player is not None and self._player.active)
+        configurable = not active and not self._closing
+        self.btn_play.setEnabled(configurable and self._plan is not None and bool(self._plan[1]))
+        self.btn_stop.setEnabled(active and not self._closing)
+        self.btn_pause.setEnabled(not self._closing and self._state in ('playing', 'waiting_game', 'paused'))
+        for widget in (self.list_scores, self.btn_add, self.btn_refresh, self.slider_speed,
+                       self.spin_transpose, self.chk_auto_fit, self.chk_loop,
+                       self.chk_foreground, self.edit_process):
+            widget.setEnabled(configurable)
+        self.chk_dry.setEnabled(configurable and sys.platform == 'win32')
 
     def _on_state(self, state: str):
+        previous = self._state
         self._state = state
         self.lbl_state.setText(_STATE_TEXT.get(state, state))
-        active = state in _ACTIVE_STATES
-        self.btn_play.setEnabled(not active)
-        self.btn_stop.setEnabled(active)
-        self.btn_pause.setEnabled(state in ('playing', 'waiting_game', 'paused'))
+        self._update_controls()
         self.btn_pause.setText('继续' if state == 'paused' else '暂停')
         if state == 'playing':
             self.lbl_state.setStyleSheet('color: #7bd88f; font-weight: 600;')
@@ -442,7 +540,7 @@ class MainWindow(QMainWindow):
             self.lbl_progress.setText('演奏完成')
         else:
             self.lbl_state.setStyleSheet('color: #9aa0a6;')
-            if state == 'idle' and self.lbl_progress.text() == '':
+            if state == 'idle' and previous != 'finished':
                 self.lbl_progress.setText('就绪')
 
     def _on_progress(self, index: int, total: int, action: str):
@@ -456,11 +554,11 @@ class MainWindow(QMainWindow):
         name = foreground_process_name() or '-'
         keyword = self.edit_process.text().strip().lower()
         matched = bool(keyword) and keyword in name.lower()
-        self.lbl_fg.setText(f'前台进程: {name}' + ('（匹配）' if matched else ''))
+        self.lbl_fg.setText(f'前台进程: {name}' + ('（关键字匹配）' if matched else ''))
         self.lbl_fg.setStyleSheet('color: #7bd88f;' if matched else 'color: #9aa0a6;')
 
     def _report_hotkey_status(self):
-        if not self._hotkeys.available:
+        if self._closing or not self._hotkeys.registration_finished:
             return
         missing = [HOTKEY_LABELS[h] for h in self._hotkeys.failed if h in HOTKEY_LABELS]
         if missing:
@@ -473,9 +571,13 @@ class MainWindow(QMainWindow):
         self.txt_log.appendPlainText(f'[{stamp}] {message}')
 
     def closeEvent(self, event):
-        try:
-            if self._player:
-                self._player.stop()
-            self._hotkeys.stop()
-        finally:
-            super().closeEvent(event)
+        if not self._closing:
+            self._closing = True
+            self._update_controls()
+        if self._player and not self._player.stop(timeout=0):
+            self.lbl_state.setText('正在停止演奏…')
+            event.ignore()
+            QTimer.singleShot(50, self.close)
+            return
+        self._hotkeys.stop()
+        super().closeEvent(event)

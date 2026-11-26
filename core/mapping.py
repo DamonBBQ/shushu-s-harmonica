@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
+from math import inf, isfinite
 from typing import Iterable
 
 from .score import ScoreEvent
@@ -41,20 +43,20 @@ def describe_action(note: PlayNote) -> str:
 
 
 def auto_transpose(pitches: Iterable[int]) -> int:
-    pitches = list(pitches)
+    counts = Counter(pitches)
     best_t, best_hits = 0, -1
     for t in range(-30, 31):
-        hits = sum(1 for p in pitches if RANGE_LOW <= p + t <= RANGE_HIGH)
+        hits = sum(counts[pitch] for pitch in range(RANGE_LOW - t, RANGE_HIGH - t + 1))
         if hits > best_hits or (hits == best_hits and abs(t) < abs(best_t)):
             best_t, best_hits = t, hits
     return best_t
 
 
 def _fold(pitch: int) -> int:
-    while pitch < RANGE_LOW:
-        pitch += 12
-    while pitch > RANGE_HIGH:
-        pitch -= 12
+    if pitch < RANGE_LOW:
+        return RANGE_LOW + (pitch - RANGE_LOW) % 12
+    if pitch > RANGE_HIGH:
+        return RANGE_HIGH - (RANGE_HIGH - pitch) % 12
     return pitch
 
 
@@ -73,19 +75,35 @@ def to_action(pitch: int) -> tuple[int, int, bool]:
 
 
 def build_play_notes(events: Iterable[ScoreEvent], transpose: int = 0,
-                     auto_fit: bool = True) -> tuple[list[PlayNote], int, int]:
-    events = list(events)
-    if not events:
-        return [], 0, 0
-    applied = transpose + (auto_transpose(e.pitch for e in events) if auto_fit else 0)
-    min_span = (PREP_MS + DEFAULT_GAP_MS + MIN_HOLD_MS) / 1000.0
-    notes: list[PlayNote] = []
-    dropped = 0
+                     auto_fit: bool = True, *, speed: float = 1.0) -> tuple[list[PlayNote], int, int]:
+    if not isfinite(speed) or speed <= 0:
+        raise ValueError('播放速度必须为有限的正数')
+
+    groups = []
     for event in events:
-        if event.duration < min_span:
-            dropped += 1
-            continue
+        candidates = (event, *event.alternatives)
+        groups.append((min(candidate.start for candidate in candidates), candidates))
+    groups.sort(key=lambda group: group[0])
+    if not groups:
+        return [], 0, 0
+
+    min_span = (PREP_MS + DEFAULT_GAP_MS + MIN_HOLD_MS) / 1000.0
+    playable: list[tuple[ScoreEvent, float]] = []
+    for index, (_, candidates) in enumerate(groups):
+        next_start = groups[index + 1][0] if index + 1 < len(groups) else inf
+        for candidate in candidates:
+            duration = min(candidate.duration, next_start - candidate.start)
+            # MIDI 秒数相减可能让刚好 72ms 的音略低于边界。
+            if duration / speed + 1e-9 >= min_span:
+                playable.append((candidate, duration))
+                break
+
+    applied = transpose
+    if auto_fit:
+        applied += auto_transpose(event.pitch + transpose for event, _ in playable)
+
+    notes = []
+    for event, duration in playable:
         key, shift, sharp = to_action(_fold(event.pitch + applied))
-        notes.append(PlayNote(event.start, event.duration, key, shift, sharp))
-    notes.sort(key=lambda n: n.start)
-    return notes, applied, dropped
+        notes.append(PlayNote(event.start, duration, key, shift, sharp))
+    return notes, applied, len(groups) - len(notes)
