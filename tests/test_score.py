@@ -272,7 +272,7 @@ class ScoreUpdaterTests(unittest.TestCase):
         first_new = b'TITLE=first\nBPM=60\n1 2\n'
         second_new = b'TITLE=second\nBPM=60\n3 4\n'
         (self.scores_dir / 'first.txt').write_bytes(first_old)
-        self.write_manifest(['first.txt'])
+        self.write_manifest(['first.txt', 'second.txt'])
         updates = (
             self.remote('first.txt', first_new),
             self.remote('second.txt', second_new),
@@ -292,7 +292,7 @@ class ScoreUpdaterTests(unittest.TestCase):
         self.assertEqual((self.scores_dir / 'first.txt').read_bytes(), first_old)
         self.assertFalse((self.scores_dir / 'second.txt').exists())
         manifest = json.loads((self.scores_dir / '.git-scores.json').read_text(encoding='utf-8'))
-        self.assertEqual(manifest['scores'], ['first.txt'])
+        self.assertEqual(manifest['scores'], ['first.txt', 'second.txt'])
 
     def test_local_same_name_is_reported_and_never_overwritten(self):
         local_data = b'TITLE=local version\nBPM=60\n5 6\n'
@@ -316,6 +316,29 @@ class ScoreUpdaterTests(unittest.TestCase):
 
         manifest = json.loads((self.scores_dir / '.git-scores.json').read_text(encoding='utf-8'))
         self.assertEqual(manifest['scores'], ['new.txt'])
+
+    def test_same_name_added_during_download_aborts_install(self):
+        managed = self.scores_dir / 'managed.txt'
+        local = self.scores_dir / 'shared.txt'
+        old_data = b'TITLE=managed\n1\n'
+        local_data = b'TITLE=local\n5 6\n'
+        new_data = b'TITLE=remote\n2 3\n'
+        managed.write_bytes(old_data)
+        self.write_manifest(['managed.txt'])
+        updates = tuple(self.remote(name, new_data) for name in ('managed.txt', 'shared.txt'))
+
+        def download(update):
+            if update.name == local.name:
+                local.write_bytes(local_data)
+            return new_data
+
+        with patch.object(self.updater, '_download', side_effect=download):
+            with self.assertRaisesRegex(UpdateError, '本地同名曲谱 shared.txt 已保留'):
+                self.updater.install_updates(updates)
+
+        self.assertEqual(managed.read_bytes(), old_data)
+        self.assertEqual(local.read_bytes(), local_data)
+        self.assertEqual(self.updater._load_managed_scores(), {'managed.txt'})
 
     def test_corrupt_manifest_stops_update_before_download(self):
         original = b'TITLE=local\nBPM=60\n1 2\n'

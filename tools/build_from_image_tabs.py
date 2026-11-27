@@ -138,7 +138,6 @@ def build_lines(song: dict, bpm: int) -> tuple[list[list[str]], list[list[dict]]
                 continue
             sep = group.get('sep_after')
             if sep == ',':
-                parts.append(',')
                 parts.append(rest_token(2))
             elif sep == '|':
                 parts.append('|')

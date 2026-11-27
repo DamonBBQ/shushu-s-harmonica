@@ -194,13 +194,25 @@ class ScoreUpdater:
 
                 for update in updates:
                     target = self.scores_dir / update.name
+                    staged_path = staging / update.name
+                    if update.name not in managed_scores:
+                        data = staged_path.read_bytes()
+                        try:
+                            with target.open('xb') as output:
+                                replaced.append((target, None))
+                                output.write(data)
+                        except FileExistsError as exc:
+                            raise UpdateError(f'本地同名曲谱 {update.name} 已保留，已取消本次更新') from exc
+                        installed.append(target)
+                        continue
+
                     backup: Path | None = None
                     if target.exists():
                         if backup_dir is None:
                             backup_dir = self._new_backup_dir()
                         backup = backup_dir / update.name
                         shutil.copy2(target, backup)
-                    os.replace(staging / update.name, target)
+                    os.replace(staged_path, target)
                     replaced.append((target, backup))
                     installed.append(target)
 
