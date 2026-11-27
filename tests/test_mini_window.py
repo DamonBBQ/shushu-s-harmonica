@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import unittest
@@ -26,6 +27,7 @@ class MiniWindowTest(unittest.TestCase):
         folder = TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         root = Path(folder.name)
+        self.scores_dir = root
         (root / 'a.txt').write_text('TITLE=第一首\nBPM=60\n1-- 2', encoding='utf-8')
         (root / 'b.txt').write_text('TITLE=第二首\nBPM=60\n3-- 4', encoding='utf-8')
         (root / 'c.txt').write_text('TITLE=第三首\nBPM=60\n5-- 6', encoding='utf-8')
@@ -104,6 +106,48 @@ class MiniWindowTest(unittest.TestCase):
         closed = QSignalSpy(reopened.closed)
         self.close_window(reopened)
         self.assertEqual(closed.count(), 1)
+
+    def test_song_speed_and_transpose_are_remembered_per_song(self):
+        window = self.window
+        window.chk_auto_fit.setChecked(False)
+        window.list_scores.setCurrentRow(0)
+        window.slider_speed.setValue(80)
+        window.spin_transpose.setValue(2)
+
+        window.list_scores.setCurrentRow(1)
+        self.assertEqual(window.slider_speed.value(), 100)
+        self.assertEqual(window.spin_transpose.value(), 0)
+        window.slider_speed.setValue(120)
+        window.spin_transpose.setValue(-3)
+
+        window.list_scores.setCurrentRow(0)
+        self.assertEqual(window.slider_speed.value(), 80)
+        self.assertEqual(window.spin_transpose.value(), 2)
+        self.wait_for(lambda: window._plan is not None)
+        self.assertEqual(window._plan[2], 2)
+
+        self.close_window(window)
+        reopened = self.open_window()
+        self.assertEqual(reopened.slider_speed.value(), 80)
+        self.assertEqual(reopened.spin_transpose.value(), 2)
+        reopened.list_scores.setCurrentRow(1)
+        self.assertEqual(reopened.slider_speed.value(), 120)
+        self.assertEqual(reopened.spin_transpose.value(), -3)
+
+    def test_song_preferences_do_not_transfer_between_local_and_git(self):
+        window = self.window
+        window.list_scores.setCurrentRow(0)
+        window.slider_speed.setValue(80)
+
+        manifest = self.scores_dir / '.git-scores.json'
+        manifest.write_text(json.dumps({'version': 1, 'scores': ['a.txt']}), encoding='utf-8')
+        window._refresh_scores()
+        self.assertEqual(window.slider_speed.value(), 100)
+
+        window.slider_speed.setValue(120)
+        manifest.write_text(json.dumps({'version': 1, 'scores': []}), encoding='utf-8')
+        window._refresh_scores()
+        self.assertEqual(window.slider_speed.value(), 80)
 
     def test_local_shortcut_defers_to_registered_global_shortcut(self):
         window = self.window

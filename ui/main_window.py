@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 import threading
@@ -49,7 +50,7 @@ from core.input_backend import (
 )
 from core.mapping import build_play_notes, describe_action
 from core.score import load_score
-from core.updater import ScoreUpdater
+from core.updater import ScoreUpdater, UpdateError
 from ui.mini_window import DEFAULT_OPACITY, MAX_OPACITY, MIN_OPACITY, MiniWindow
 from ui.theme import FOREGROUND_MATCH, FOREGROUND_MUTED, MAIN_WINDOW_STYLE, state_color
 
@@ -60,6 +61,9 @@ else:
 
 _ACTIVE_STATES = ('countdown', 'playing', 'paused', 'waiting_game')
 _SCORE_SUFFIXES = ('.mid', '.midi', '.txt')
+_SONG_PREFERENCES_KEY = 'playback/songPreferences'
+_DEFAULT_SPEED_PERCENT = 100
+_DEFAULT_TRANSPOSE = 0
 
 _STATE_TEXT = {
     'idle': '空闲',
@@ -116,6 +120,7 @@ class MainWindow(QMainWindow):
         self._plan = None
         self._pending_mini_score: Path | None = None
         self._settings = QSettings('DamonBBQ', 'shushu-s-harmonica')
+        self._managed_scores: set[str] = set()
 
         self._build_ui()
         self._build_mini_window()
@@ -272,9 +277,10 @@ class MainWindow(QMainWindow):
         speed_row.setSpacing(12)
         self.slider_speed = QSlider(Qt.Horizontal)
         self.slider_speed.setRange(50, 200)
-        self.slider_speed.setValue(100)
+        self.slider_speed.setValue(_DEFAULT_SPEED_PERCENT)
         self.slider_speed.setAccessibleName(speed_label.text())
-        self.lbl_speed = QLabel('100%')
+        self.slider_speed.setToolTip('速度按当前曲目自动保存，下次选择时恢复')
+        self.lbl_speed = QLabel(f'{_DEFAULT_SPEED_PERCENT}%')
         self.lbl_speed.setMinimumWidth(self.lbl_speed.fontMetrics().horizontalAdvance('200%'))
         self.lbl_speed.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.slider_speed.valueChanged.connect(self._on_speed_changed)
@@ -286,8 +292,10 @@ class MainWindow(QMainWindow):
         grid.addWidget(transpose_label, 3, 0)
         self.spin_transpose = QSpinBox()
         self.spin_transpose.setRange(-12, 12)
+        self.spin_transpose.setValue(_DEFAULT_TRANSPOSE)
         self.spin_transpose.setSuffix(' 半音')
-        self.spin_transpose.valueChanged.connect(lambda *_: self._update_info())
+        self.spin_transpose.setToolTip('手动移调按当前曲目自动保存，下次选择时恢复')
+        self.spin_transpose.valueChanged.connect(self._on_transpose_changed)
         transpose_label.setBuddy(self.spin_transpose)
         self.spin_transpose.setAccessibleName(transpose_label.text())
         grid.addWidget(self.spin_transpose, 3, 1)
@@ -435,6 +443,11 @@ class MainWindow(QMainWindow):
 
     def _refresh_scores(self, selected: Path | None = None):
         selected = selected or self._selected_path()
+        try:
+            self._managed_scores = ScoreUpdater(SCORES_DIR).managed_score_names()
+        except UpdateError as exc:
+            self._managed_scores = set()
+            self._append_log(f'读取 Git 曲目清单失败，播放偏好按本地曲目处理：{exc}')
         with QSignalBlocker(self.list_scores):
             self.list_scores.clear()
             try:
@@ -456,6 +469,7 @@ class MainWindow(QMainWindow):
             if files:
                 self.list_scores.setCurrentRow(selected_row)
         self._sync_mini_library()
+        self._restore_song_preferences()
         self._update_info()
 
     def _check_for_updates(self):
@@ -598,6 +612,7 @@ class MainWindow(QMainWindow):
         self.lbl_progress.setText('就绪')
         self.track_progress.setValue(0)
         self._sync_mini_library()
+        self._restore_song_preferences()
         self._update_info()
 
     def _update_info(self):
@@ -662,8 +677,70 @@ class MainWindow(QMainWindow):
             self._score_cache.popitem(last=False)
         self._update_info()
 
+    def _song_preference_id(self, path: Path) -> str:
+        source = 'git' if path.name in self._managed_scores else 'local'
+        return f'{source}:{path.name}'
+
+    def _load_song_preferences(self) -> dict[str, dict[str, int]]:
+        raw = self._settings.value(_SONG_PREFERENCES_KEY, '')
+        if not isinstance(raw, str) or not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(payload, dict) or payload.get('version') != 1:
+            return {}
+        songs = payload.get('songs')
+        if not isinstance(songs, dict):
+            return {}
+        preferences: dict[str, dict[str, int]] = {}
+        for song_id, values in songs.items():
+            if not isinstance(song_id, str) or not isinstance(values, dict):
+                continue
+            transpose = values.get('transpose')
+            speed = values.get('speed_percent')
+            if (type(transpose) is not int
+                    or not self.spin_transpose.minimum() <= transpose <= self.spin_transpose.maximum()):
+                continue
+            if (type(speed) is not int
+                    or not self.slider_speed.minimum() <= speed <= self.slider_speed.maximum()):
+                continue
+            preferences[song_id] = {'transpose': transpose, 'speed_percent': speed}
+        return preferences
+
+    def _restore_song_preferences(self):
+        path = self._selected_path()
+        preference = self._load_song_preferences().get(self._song_preference_id(path), {}) if path else {}
+        speed = preference.get('speed_percent', _DEFAULT_SPEED_PERCENT)
+        transpose = preference.get('transpose', _DEFAULT_TRANSPOSE)
+        with QSignalBlocker(self.slider_speed), QSignalBlocker(self.spin_transpose):
+            self.slider_speed.setValue(speed)
+            self.spin_transpose.setValue(transpose)
+        self.lbl_speed.setText(f'{speed}%')
+
+    def _save_song_preferences(self):
+        path = self._selected_path()
+        if path is None:
+            return
+        preferences = self._load_song_preferences()
+        preferences[self._song_preference_id(path)] = {
+            'transpose': self.spin_transpose.value(),
+            'speed_percent': self.slider_speed.value(),
+        }
+        payload = {'version': 1, 'songs': preferences}
+        self._settings.setValue(
+            _SONG_PREFERENCES_KEY,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
+        )
+
     def _on_speed_changed(self, value: int):
         self.lbl_speed.setText(f'{value}%')
+        self._save_song_preferences()
+        self._update_info()
+
+    def _on_transpose_changed(self, _value: int):
+        self._save_song_preferences()
         self._update_info()
 
     def _add_score(self):

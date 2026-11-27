@@ -124,6 +124,9 @@ class ScoreUpdater:
     def __init__(self, scores_dir: str | Path):
         self.scores_dir = Path(scores_dir)
 
+    def managed_score_names(self) -> set[str]:
+        return self._load_managed_scores()
+
     def check_for_updates(self) -> UpdateCheck:
         remote_scores = _fetch_remote_scores()
         managed_scores = self._load_managed_scores()
