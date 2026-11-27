@@ -7,17 +7,20 @@ from typing import Callable
 HOTKEY_START_STOP = 1
 HOTKEY_PAUSE = 2
 HOTKEY_EMERGENCY = 3
+HOTKEY_MINI_WINDOW = 4
 
 HOTKEY_LABELS = {
     HOTKEY_START_STOP: 'Shift+F9',
     HOTKEY_PAUSE: 'Shift+F10',
     HOTKEY_EMERGENCY: 'Shift+F8',
+    HOTKEY_MINI_WINDOW: 'F11',
 }
 
 _VK = {
     HOTKEY_START_STOP: 0x78,
     HOTKEY_PAUSE: 0x79,
     HOTKEY_EMERGENCY: 0x77,
+    HOTKEY_MINI_WINDOW: 0x7A,
 }
 _MOD_SHIFT = 0x0004
 _MOD_NOREPEAT = 0x4000
@@ -26,15 +29,35 @@ _WM_QUIT = 0x0012
 
 
 class GlobalHotkeys:
-    def __init__(self, on_trigger: Callable[[int], None]):
+    def __init__(self, on_trigger: Callable[[int], None], on_status: Callable[[], None]):
         self._on_trigger = on_trigger
+        self._on_status = on_status
         self._thread: threading.Thread | None = None
         self._thread_id = 0
-        self.failed: list[int] = []
+        self._registered: frozenset[int] | None = None
+        self._closing = threading.Event()
 
     @property
     def available(self) -> bool:
         return sys.platform == 'win32'
+
+    @property
+    def registration_finished(self) -> bool:
+        return self._registered is not None
+
+    @property
+    def failed(self) -> list[int]:
+        registered = self._registered
+        if registered is None:
+            return []
+        return [hotkey_id for hotkey_id in _VK if hotkey_id not in registered]
+
+    @property
+    def emergency_ready(self) -> bool:
+        return self.is_registered(HOTKEY_EMERGENCY)
+
+    def is_registered(self, hotkey_id: int) -> bool:
+        return not self._closing.is_set() and hotkey_id in (self._registered or ())
 
     def start(self) -> None:
         if not self.available:
@@ -43,23 +66,28 @@ class GlobalHotkeys:
         self._thread.start()
 
     def _run(self) -> None:
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.windll.user32
-        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
-        msg = wintypes.MSG()
-        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
-
-        registered = []
-        for hotkey_id, vk in _VK.items():
-            if user32.RegisterHotKey(None, hotkey_id, _MOD_SHIFT | _MOD_NOREPEAT, vk):
-                registered.append(hotkey_id)
-            else:
-                self.failed.append(hotkey_id)
-
+        registered: set[int] = set()
         try:
-            while True:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            msg = wintypes.MSG()
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+            self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+            if self._closing.is_set():
+                return
+
+            for hotkey_id, vk in _VK.items():
+                modifiers = _MOD_NOREPEAT
+                if hotkey_id != HOTKEY_MINI_WINDOW:
+                    modifiers |= _MOD_SHIFT
+                if user32.RegisterHotKey(None, hotkey_id, modifiers, vk):
+                    registered.add(hotkey_id)
+            self._registered = frozenset(registered)
+            self._on_status()
+
+            while not self._closing.is_set():
                 ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if ret <= 0:
                     break
@@ -69,11 +97,18 @@ class GlobalHotkeys:
                     except Exception:
                         pass
         finally:
+            self._registered = frozenset()
             for hotkey_id in registered:
                 user32.UnregisterHotKey(None, hotkey_id)
+            self._thread_id = 0
+            if not self._closing.is_set():
+                self._on_status()
 
     def stop(self) -> None:
-        if not self.available or not self._thread_id:
-            return
-        import ctypes
-        ctypes.windll.user32.PostThreadMessageW(self._thread_id, _WM_QUIT, 0, 0)
+        self._closing.set()
+        thread_id = self._thread_id
+        if self.available and thread_id:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(thread_id, _WM_QUIT, 0, 0)
+        if self._thread is not None:
+            self._thread.join(timeout=0.25)
