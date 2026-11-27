@@ -276,9 +276,8 @@ BPM=100
 │   ├── main_window.py       # PySide6 主界面与信号桥
 │   └── mini_window.py       # 迷你浮窗
 ├── scores/
-│   ├── twinkle.mid          # 示例 MIDI（42 音）
 │   ├── 小星星.txt            # 示例简谱（56 音）
-│   └── 其他 TXT              # 图片转录谱和单音谱
+│   └── 其他 TXT              # 单音简谱
 ├── docs/
 │   ├── DESIGN.md            # 详细设计文档
 │   ├── screenshot.png       # 主窗口截图

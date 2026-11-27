@@ -30,10 +30,11 @@ class ScoreTests(unittest.TestCase):
         return load_midi(path)
 
     def test_bundled_scores(self):
-        scores = Path(__file__).resolve().parents[1] / 'scores'
-        for name, count in (('twinkle.mid', 42), ('小星星.txt', 56)):
-            with self.subTest(name=name):
-                score = load_score(scores / name)
+        root = Path(__file__).resolve().parents[1]
+        fixture = Path(__file__).resolve().parent / 'fixtures' / 'sample.mid'
+        for path, count in ((fixture, 42), (root / 'scores' / '小星星.txt', 56)):
+            with self.subTest(name=path.name):
+                score = load_score(path)
                 self.assertEqual(len(score.events), count)
                 self.assertEqual(len(build_play_notes(score.events)[0]), count)
 
