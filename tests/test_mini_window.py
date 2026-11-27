@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtTest import QSignalSpy, QTest
@@ -261,6 +261,68 @@ class MiniWindowTest(unittest.TestCase):
         self.assertIn('曲库已更新', self.window.lbl_update.text())
         self.assertTrue(self.window.btn_update.isEnabled())
         information.assert_called_once()
+
+    def test_frozen_update_installs_complete_application_package(self):
+        release = main_window.ApplicationRelease(
+            version='1.1.0',
+            tag='v1.1.0',
+            asset_name='HarmonicaPlayer-1.1.0-windows-x64.zip',
+            download_url='https://github.com/example/releases/download/v1.1.0/update.zip',
+            size=10,
+            sha256='0' * 64,
+        )
+        prepared = Mock(spec=main_window.PreparedUpdate)
+        with (patch.object(main_window.sys, 'frozen', True, create=True),
+              patch.object(main_window.ApplicationUpdater, 'check_for_update', return_value=release),
+              patch.object(main_window.ApplicationUpdater, 'prepare_update', return_value=prepared) as prepare,
+              patch.object(main_window.ScoreUpdater, 'check_for_updates') as check_scores,
+              patch.object(main_window.QMessageBox, 'question',
+                           return_value=QMessageBox.StandardButton.Yes),
+              patch.object(self.window, 'close') as close):
+            self.window.btn_update.click()
+            self.wait_for(lambda: prepared.launch.called and close.called)
+
+        prepare.assert_called_once()
+        check_scores.assert_not_called()
+        prepared.launch.assert_called_once_with()
+        prepared.cleanup.assert_not_called()
+        self.assertFalse(self.window._updating)
+
+    def test_cancelling_application_update_restores_controls(self):
+        release = main_window.ApplicationRelease(
+            version='1.1.0', tag='v1.1.0', asset_name='update.zip',
+            download_url='https://github.com/example/update.zip', size=10, sha256='0' * 64,
+        )
+        with (patch.object(main_window.sys, 'frozen', True, create=True),
+              patch.object(main_window.ApplicationUpdater, 'check_for_update', return_value=release),
+              patch.object(main_window.ApplicationUpdater, 'prepare_update') as prepare,
+              patch.object(main_window.QMessageBox, 'question',
+                           return_value=QMessageBox.StandardButton.No)):
+            self.window.btn_update.click()
+            self.wait_for(lambda: not self.window._updating)
+
+        prepare.assert_not_called()
+        self.assertTrue(self.window.btn_update.isEnabled())
+        self.assertIn('已取消', self.window.lbl_update.text())
+
+    def test_application_package_failure_restores_controls(self):
+        release = main_window.ApplicationRelease(
+            version='1.1.0', tag='v1.1.0', asset_name='update.zip',
+            download_url='https://github.com/example/update.zip', size=10, sha256='0' * 64,
+        )
+        with (patch.object(main_window.sys, 'frozen', True, create=True),
+              patch.object(main_window.ApplicationUpdater, 'check_for_update', return_value=release),
+              patch.object(main_window.ApplicationUpdater, 'prepare_update',
+                           side_effect=UpdateError('校验失败')),
+              patch.object(main_window.QMessageBox, 'question',
+                           return_value=QMessageBox.StandardButton.Yes),
+              patch.object(main_window.QMessageBox, 'warning') as warning):
+            self.window.btn_update.click()
+            self.wait_for(lambda: not self.window._updating)
+
+        self.assertTrue(self.window.btn_update.isEnabled())
+        self.assertEqual(self.window.lbl_update.text(), '更新失败')
+        warning.assert_called_once()
 
     @staticmethod
     def without_countdown(**options):

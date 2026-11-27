@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.app_updater import ApplicationRelease, ApplicationUpdater, PreparedUpdate
 from core.engine import PlaybackOptions, Player
 from core.hotkeys import (
     HOTKEY_EMERGENCY,
@@ -51,6 +52,7 @@ from core.input_backend import (
 from core.mapping import build_play_notes, describe_action
 from core.score import load_score
 from core.updater import ScoreUpdater, UpdateError
+from core.version import __version__
 from ui.mini_window import DEFAULT_OPACITY, MAX_OPACITY, MIN_OPACITY, MiniWindow
 from ui.theme import FOREGROUND_MATCH, FOREGROUND_MUTED, MAIN_WINDOW_STYLE, state_color
 
@@ -83,6 +85,8 @@ class _Bridge(QObject):
     progress = Signal(int, int, str)
     score_read = Signal(object, object, object)
     update_progress = Signal(int, int, str)
+    app_update_checked = Signal(object)
+    app_update_ready = Signal(object)
     update_checked = Signal(object)
     update_installed = Signal(object)
     update_failed = Signal(str)
@@ -105,6 +109,8 @@ class MainWindow(QMainWindow):
         self._bridge.progress.connect(self._on_progress)
         self._bridge.score_read.connect(self._on_score_read)
         self._bridge.update_progress.connect(self._on_update_progress)
+        self._bridge.app_update_checked.connect(self._on_app_update_checked)
+        self._bridge.app_update_ready.connect(self._on_app_update_ready)
         self._bridge.update_checked.connect(self._on_update_checked)
         self._bridge.update_installed.connect(self._on_update_installed)
         self._bridge.update_failed.connect(self._on_update_failed)
@@ -162,7 +168,7 @@ class MainWindow(QMainWindow):
         titles.setSpacing(3)
         title = QLabel('口琴自动演奏器')
         title.setObjectName('title')
-        subtitle = QLabel('三角洲行动 · MIDI 与简谱 TXT')
+        subtitle = QLabel(f'三角洲行动 · MIDI 与简谱 TXT · v{__version__}')
         subtitle.setObjectName('subtitle')
         titles.addWidget(title)
         titles.addWidget(subtitle)
@@ -196,7 +202,7 @@ class MainWindow(QMainWindow):
         self.btn_refresh.clicked.connect(lambda: self._refresh_scores())
         self.btn_update = QPushButton('检查更新')
         self.btn_update.setObjectName('updateButton')
-        self.btn_update.setToolTip('从 GitHub main 分支更新 Git 清单中的内置曲谱，本地同名曲目保留')
+        self.btn_update.setToolTip('优先更新完整程序与功能；没有新程序版本时更新内置曲谱，本地曲目保留')
         self.btn_update.clicked.connect(self._check_for_updates)
         row.addWidget(self.btn_add, 1)
         row.addWidget(self.btn_refresh)
@@ -477,18 +483,95 @@ class MainWindow(QMainWindow):
                 or (self._player and self._player.active)):
             return
         self._updating = True
-        self.lbl_update.setText('正在检查 GitHub 曲库…')
-        self._append_log('正在检查在线曲库…')
+        self.lbl_update.setText('正在检查程序与曲库更新…')
+        self._append_log('正在检查在线更新…')
         self._update_controls()
         threading.Thread(target=self._run_update_check, daemon=True).start()
 
     def _run_update_check(self):
         try:
-            check = ScoreUpdater(SCORES_DIR).check_for_updates()
+            release = None
+            if getattr(sys, 'frozen', False):
+                release = ApplicationUpdater().check_for_update()
+            if release is not None:
+                self._bridge.app_update_checked.emit(release)
+            else:
+                check = ScoreUpdater(SCORES_DIR).check_for_updates()
+                self._bridge.update_checked.emit(check)
+        except Exception as exc:
+            self._bridge.update_failed.emit(str(exc))
+
+    def _on_app_update_checked(self, release: ApplicationRelease):
+        if self._closing:
+            return
+        answer = QMessageBox.question(
+            self,
+            '发现程序更新',
+            f'发现新版本 v{release.version}，是否下载完整更新包？\n\n'
+            '更新包含程序功能、运行依赖和内置曲谱。安装时会保留本地曲谱与个人设置，'
+            '并在程序退出后自动替换、重新启动。',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._updating = False
+            self.lbl_update.setText(f'发现程序 v{release.version}，已取消')
+            self._append_log(f'已取消程序更新 v{release.version}')
+            self._update_controls()
+            return
+        self.lbl_update.setText(f'正在下载程序 v{release.version}…')
+        self._append_log(f'开始下载完整程序更新包：{release.asset_name}')
+        threading.Thread(target=self._run_app_update_install, args=(release,), daemon=True).start()
+
+    def _run_app_update_install(self, release: ApplicationRelease):
+        def report(done: int, total: int, name: str):
+            self._bridge.update_progress.emit(done, total, name)
+
+        try:
+            prepared = ApplicationUpdater().prepare_update(
+                release,
+                Path(sys.executable).resolve().parent,
+                SCORES_DIR,
+                report,
+            )
         except Exception as exc:
             self._bridge.update_failed.emit(str(exc))
         else:
-            self._bridge.update_checked.emit(check)
+            self._bridge.app_update_ready.emit(prepared)
+
+    def _on_app_update_ready(self, prepared: PreparedUpdate):
+        if self._closing:
+            prepared.cleanup()
+            return
+        answer = QMessageBox.question(
+            self,
+            '安装程序更新',
+            '完整更新包已下载并通过 SHA-256 校验。是否立即安装？\n\n'
+            '程序将关闭并自动替换，随后重新启动。本地曲谱和个人设置会保留；'
+            '更新失败时会自动恢复原程序目录。',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            prepared.cleanup()
+            self._updating = False
+            self.lbl_update.setText('更新包已下载，已取消安装')
+            self._append_log('已取消安装程序更新，临时文件已清理')
+            self._update_controls()
+            return
+        try:
+            prepared.launch()
+        except Exception as exc:
+            prepared.cleanup()
+            self._on_update_failed(f'启动程序更新失败：{exc}')
+            return
+        self._settings.sync()
+        self._updating = False
+        self._closing = True
+        self.lbl_update.setText('更新包已就绪，正在退出并安装…')
+        self._append_log('正在退出程序，Windows 更新助手将替换文件并重新启动')
+        self._update_controls()
+        self.close()
 
     def _on_update_checked(self, check):
         if self._closing:
@@ -544,7 +627,11 @@ class MainWindow(QMainWindow):
             self._bridge.update_installed.emit(result)
 
     def _on_update_progress(self, done: int, total: int, name: str):
-        self.lbl_update.setText(f'正在下载并校验 {done}/{total}：{name}')
+        if name.endswith('.zip'):
+            self.lbl_update.setText(
+                f'正在下载并校验程序更新包：{done / 1048576:.1f}/{total / 1048576:.1f} MB')
+        else:
+            self.lbl_update.setText(f'正在下载并校验 {done}/{total}：{name}')
 
     def _on_update_installed(self, result):
         if self._closing:
@@ -565,7 +652,7 @@ class MainWindow(QMainWindow):
             return
         self._updating = False
         self.lbl_update.setText('更新失败')
-        self._append_log(f'曲库更新失败：{message}')
+        self._append_log(f'更新失败：{message}')
         self._update_controls()
         QMessageBox.warning(self, '更新失败', message)
 
@@ -971,7 +1058,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self._updating:
-            self._append_log('曲库更新尚未结束，请稍候再关闭程序')
+            self._append_log('更新尚未结束，请稍候再关闭程序')
             event.ignore()
             return
         if not self._closing:

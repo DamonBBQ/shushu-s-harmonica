@@ -1,6 +1,6 @@
 # shushu-s-harmonica
 
-三角洲行动 PC 口琴自动演奏器 · `v1.0`
+三角洲行动 PC 口琴自动演奏器 · `v1.1.0`
 
 ## 主窗口
 
@@ -39,6 +39,12 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 python main.py
 ```
+
+## 更新程序
+
+Windows 打包版点击「检查更新」时，会优先检查 GitHub Release 的完整程序包。发现新版本后，先下载并校验 SHA-256，再由 Windows 更新助手在程序退出后替换 EXE、运行依赖和内置曲谱，最后自动重启；本地曲谱与 QSettings 中的个人设置保留。
+
+没有可用的新程序包时，按钮仍会检查并更新 Git 清单内的曲谱。旧版 v1.0 还没有完整程序更新器，需要手动安装一次 v1.1.0 或更高版本，之后即可使用应用内更新。 [曲库与更新说明](docs/LIBRARY.md#检查更新)
 
 ## 注意事项
 
