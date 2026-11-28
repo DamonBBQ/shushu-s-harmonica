@@ -7,12 +7,15 @@ from tempfile import TemporaryDirectory
 from threading import Event
 from unittest.mock import Mock, patch
 
+import mido
+
 from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QListWidget, QMessageBox, QPushButton, QSlider
 
 from core.engine import PlaybackOptions
 from core.input_backend import DryRunBackend
+from core.midi_preprocess import MidiPreprocessOptions
 from core.updater import RemoteScore, UpdateCheck, UpdateError, git_blob_sha
 from ui import main_window
 
@@ -61,6 +64,27 @@ class MiniWindowTest(unittest.TestCase):
                 self.fail('Timed out waiting for the Qt window to update')
             self.app.processEvents()
             time.sleep(0.005)
+
+    @staticmethod
+    def write_midi(path, variation=0):
+        midi = mido.MidiFile(type=1, ticks_per_beat=1000)
+        piano = midi.add_track()
+        melody = midi.add_track()
+        piano.append(mido.MetaMessage('track_name', name='Piano accompaniment'))
+        piano.append(mido.Message('program_change', program=0))
+        melody.append(mido.MetaMessage('track_name', name='Lead melody'))
+        melody.append(mido.Message('program_change', program=73))
+        for index, pitch in enumerate((72, 74, 76, 79, 81, 79, 76, 74)):
+            start = index * 400
+            piano.extend((
+                mido.Message('note_on', note=pitch - 12 + variation, time=400 if index else 0),
+                mido.Message('note_off', note=pitch - 12 + variation, time=300),
+            ))
+            melody.extend((
+                mido.Message('note_on', note=pitch + variation, time=400 if index else 0),
+                mido.Message('note_off', note=pitch + variation, time=320),
+            ))
+        midi.save(path)
 
     def choose_song(self, row):
         mini = self.window._mini
@@ -148,6 +172,161 @@ class MiniWindowTest(unittest.TestCase):
         manifest.write_text(json.dumps({'version': 1, 'scores': []}), encoding='utf-8')
         window._refresh_scores()
         self.assertEqual(window.slider_speed.value(), 80)
+
+    def test_midi_import_preprocesses_copy_without_touching_source_or_scores_cache(self):
+        incoming = self.scores_dir / 'incoming'
+        incoming.mkdir()
+        source = incoming / 'imported.mid'
+        self.write_midi(source)
+        original = source.read_bytes()
+        cache = TemporaryDirectory()
+        self.addCleanup(cache.cleanup)
+        self.window._midi_cache_dir = Path(cache.name)
+
+        self.window._import_scores([source])
+        destination = self.scores_dir / source.name
+        self.wait_for(lambda: self.window._plan is not None
+                      and self.window._plan[0].midi_analysis is not None
+                      and 'MIDI 预处理完成' in self.window.txt_log.toPlainText())
+
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(destination.read_bytes(), original)
+        self.assertEqual(self.window._plan[0].midi_analysis.selected.track, 1)
+        self.assertTrue(self.window.btn_midi.isEnabled())
+        self.assertIn('声部', self.window.lbl_info.text())
+        self.assertTrue(list(Path(cache.name).glob('*.json')))
+        self.assertFalse(list(self.scores_dir.rglob('*.json')))
+
+        self.write_midi(source, variation=1)
+        self.window._import_scores([source])
+        self.assertEqual(destination.read_bytes(), original)
+        self.assertIn('未覆盖', self.window.txt_log.toPlainText())
+
+    def test_import_does_not_overwrite_when_existence_check_is_stale(self):
+        incoming = self.scores_dir / 'incoming'
+        incoming.mkdir()
+        source = incoming / 'race.txt'
+        source.write_text('TITLE=新文件\nBPM=60\n1-- 2', encoding='utf-8')
+        destination = self.scores_dir / source.name
+        destination.write_text('TITLE=本地文件\nBPM=60\n3-- 4', encoding='utf-8')
+        original = destination.read_bytes()
+        original_exists = Path.exists
+
+        def stale_exists(path):
+            return False if path == destination else original_exists(path)
+
+        with patch.object(Path, 'exists', stale_exists):
+            self.window._import_scores([source])
+
+        self.assertEqual(destination.read_bytes(), original)
+        self.assertIn('未覆盖', self.window.txt_log.toPlainText())
+
+    def test_failed_import_removes_partial_destination(self):
+        incoming = self.scores_dir / 'incoming'
+        incoming.mkdir()
+        source = incoming / 'partial.txt'
+        source.write_text('TITLE=新文件\nBPM=60\n1-- 2', encoding='utf-8')
+        destination = self.scores_dir / source.name
+
+        with patch.object(main_window.shutil, 'copyfileobj', side_effect=OSError('disk full')):
+            self.window._import_scores([source])
+
+        self.assertFalse(destination.exists())
+        self.assertIn('disk full', self.window.txt_log.toPlainText())
+
+    def test_speed_and_transpose_reuse_cached_source_hash(self):
+        path = self.scores_dir / 'hash-reuse.mid'
+        self.write_midi(path)
+        cache = TemporaryDirectory()
+        self.addCleanup(cache.cleanup)
+        self.window._midi_cache_dir = Path(cache.name)
+        self.window._refresh_scores(path)
+        self.wait_for(lambda: self.window._plan is not None
+                      and self.window._plan[0].midi_analysis is not None)
+
+        with patch.object(main_window, 'sha256_file', side_effect=AssertionError('重复计算哈希')) as digest:
+            self.window.slider_speed.setValue(80)
+            self.window.spin_transpose.setValue(2)
+            self.app.processEvents()
+
+        digest.assert_not_called()
+        self.assertIsNotNone(self.window._plan)
+        self.assertEqual(self.window.slider_speed.value(), 80)
+        self.assertEqual(self.window.spin_transpose.value(), 2)
+
+    def test_midi_manual_override_is_remembered_and_reset_when_content_changes(self):
+        path = self.scores_dir / 'melody.mid'
+        self.write_midi(path)
+        cache = TemporaryDirectory()
+        self.addCleanup(cache.cleanup)
+        self.window._midi_cache_dir = Path(cache.name)
+        self.window._refresh_scores(path)
+        self.wait_for(lambda: self.window._plan is not None
+                      and self.window._plan[0].midi_analysis is not None)
+        original_hash = self.window._plan[0].midi_analysis.source_sha256
+        self.assertEqual(self.window._plan[0].midi_analysis.selected.track, 1)
+
+        self.window._apply_midi_options(MidiPreprocessOptions(mode='manual', track=0, channel=0))
+        self.wait_for(lambda: self.window._plan is not None
+                      and self.window._plan[0].midi_analysis.options.mode == 'manual')
+        self.assertEqual(self.window._plan[0].midi_analysis.selected.track, 0)
+        self.window.list_scores.setCurrentRow(0)
+        self.wait_for(lambda: self.window._plan is not None and self.window._plan[0].name == '第一首')
+        melody_row = next(row for row in range(self.window.list_scores.count())
+                          if Path(self.window.list_scores.item(row).data(Qt.UserRole)) == path)
+        self.window.list_scores.setCurrentRow(melody_row)
+        self.wait_for(lambda: self.window._plan is not None
+                      and self.window._plan[0].midi_analysis.options.mode == 'manual')
+
+        self.close_window(self.window)
+        reopened = self.open_window()
+        reopened._midi_cache_dir = Path(cache.name)
+        reopened.list_scores.setCurrentRow(melody_row)
+        self.wait_for(lambda: reopened._plan is not None
+                      and reopened._plan[0].midi_analysis.options.mode == 'manual')
+        self.assertEqual(reopened._plan[0].midi_analysis.selected.track, 0)
+
+        self.write_midi(path, variation=1)
+        reopened._refresh_scores()
+        self.wait_for(lambda: reopened._plan is not None
+                      and reopened._plan[0].midi_analysis.source_sha256 != original_hash
+                      and reopened._plan[0].midi_analysis.options.mode == 'auto')
+        self.assertEqual(reopened._plan[0].midi_analysis.selected.track, 1)
+
+    def test_midi_voice_dialog_lists_candidates_and_switches_modes(self):
+        path = self.scores_dir / 'voices.mid'
+        self.write_midi(path)
+        cache = TemporaryDirectory()
+        self.addCleanup(cache.cleanup)
+        self.window._midi_cache_dir = Path(cache.name)
+        self.window._refresh_scores(path)
+        self.wait_for(lambda: self.window._plan is not None
+                      and self.window._plan[0].midi_analysis is not None)
+
+        with patch.object(main_window.QDialog, 'exec', return_value=0):
+            self.window._open_midi_voices()
+        dialog = self.window.findChild(main_window.QDialog, 'midiVoicesDialog')
+        self.assertIsNotNone(dialog)
+        table = dialog.findChild(main_window.QTableWidget, 'midiCandidateTable')
+        self.assertEqual(table.rowCount(), 2)
+        dialog.findChild(QPushButton, 'midiLegacy').click()
+        self.wait_for(lambda: self.window._plan is not None
+                      and self.window._plan[0].midi_analysis.options.mode == 'legacy')
+        self.assertEqual(self.window._plan[0].midi_analysis.confidence_level, 'legacy')
+        dialog.close()
+        dialog.deleteLater()
+        self.app.processEvents()
+
+        with patch.object(main_window.QDialog, 'exec', return_value=0):
+            self.window._open_midi_voices()
+        dialog = self.window.findChild(main_window.QDialog, 'midiVoicesDialog')
+        dialog.findChild(QPushButton, 'midiAuto').click()
+        self.wait_for(lambda: self.window._plan is not None
+                      and self.window._plan[0].midi_analysis.options.mode == 'auto')
+        self.assertEqual(self.window._plan[0].midi_analysis.selected.track, 1)
+        dialog.close()
+        dialog.deleteLater()
+        self.app.processEvents()
 
     def test_local_shortcut_defers_to_registered_global_shortcut(self):
         window = self.window

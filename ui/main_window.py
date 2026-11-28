@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import shutil
 import sys
 import threading
@@ -8,10 +9,13 @@ import time
 from collections import Counter, OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPoint, QSettings, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QSettings, QSignalBlocker, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtGui import QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
+    QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -29,6 +33,8 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -50,6 +56,12 @@ from core.input_backend import (
     is_process_elevated,
 )
 from core.mapping import build_play_notes, describe_action
+from core.midi_preprocess import (
+    MIDI_PREPROCESS_VERSION,
+    MidiPreprocessOptions,
+    preprocess_midi,
+    sha256_file,
+)
 from core.score import load_score
 from core.updater import ScoreUpdater, UpdateError
 from core.version import __version__
@@ -84,6 +96,7 @@ class _Bridge(QObject):
     log = Signal(str)
     progress = Signal(int, int, str)
     score_read = Signal(object, object, object)
+    midi_preprocessed = Signal(object, object, object)
     update_progress = Signal(int, int, str)
     app_update_checked = Signal(object)
     app_update_ready = Signal(object)
@@ -108,6 +121,7 @@ class MainWindow(QMainWindow):
         self._bridge.log.connect(self._append_log)
         self._bridge.progress.connect(self._on_progress)
         self._bridge.score_read.connect(self._on_score_read)
+        self._bridge.midi_preprocessed.connect(self._on_midi_preprocessed)
         self._bridge.update_progress.connect(self._on_update_progress)
         self._bridge.app_update_checked.connect(self._on_app_update_checked)
         self._bridge.app_update_ready.connect(self._on_app_update_ready)
@@ -122,7 +136,13 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._updating = False
         self._score_loading = False
+        self._score_request: tuple | None = None
         self._score_cache = OrderedDict()
+        self._source_hashes: dict[Path, tuple[tuple[int, int], str]] = {}
+        self._midi_cache_dir = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)) / 'midi-preprocess'
+        self._preprocess_queue: queue.Queue[Path | None] = queue.Queue()
+        self._preprocess_worker: threading.Thread | None = None
+        self._low_confidence_notified: set[str] = set()
         self._plan = None
         self._pending_mini_score: Path | None = None
         self._settings = QSettings('DamonBBQ', 'shushu-s-harmonica')
@@ -221,6 +241,15 @@ class MainWindow(QMainWindow):
         self.lbl_info.setObjectName('info')
         self.lbl_info.setWordWrap(True)
         details_layout.addWidget(self.lbl_info)
+        self.lbl_midi_hint = QLabel('')
+        self.lbl_midi_hint.setObjectName('hint')
+        self.lbl_midi_hint.setWordWrap(True)
+        details_layout.addWidget(self.lbl_midi_hint)
+        self.btn_midi = QPushButton('MIDI 声部…')
+        self.btn_midi.setObjectName('midiVoicesButton')
+        self.btn_midi.setToolTip('查看自动识别的旋律声部、置信度，或手动指定轨道与通道')
+        self.btn_midi.clicked.connect(self._open_midi_voices)
+        details_layout.addWidget(self.btn_midi)
         left.addWidget(details)
         body.addWidget(library, 4)
 
@@ -638,6 +667,7 @@ class MainWindow(QMainWindow):
             return
         self._updating = False
         self._score_cache.clear()
+        self._source_hashes.clear()
         count = len(result.installed)
         self.lbl_update.setText(f'曲库已更新（{count} 个文件）')
         self._append_log(f'曲库更新完成：{count} 个文件')
@@ -718,20 +748,38 @@ class MainWindow(QMainWindow):
             return
         try:
             stat = path.stat()
+            signature = (stat.st_size, stat.st_mtime_ns)
+            cached_hash = self._source_hashes.get(path)
+            if cached_hash is not None and cached_hash[0] == signature:
+                source_hash = cached_hash[1]
+            else:
+                source_hash = sha256_file(path)
+                self._source_hashes[path] = (signature, source_hash)
         except OSError as exc:
             self.lbl_info.setText(f'无法读取曲谱：{exc}')
             return
-        key = (path, stat.st_mtime_ns, stat.st_size)
+        if path.suffix.lower() in ('.mid', '.midi'):
+            options = self._midi_options_for(path, source_hash)
+            algorithm = MIDI_PREPROCESS_VERSION
+            fingerprint = options.fingerprint
+        else:
+            options = None
+            algorithm = 'txt'
+            fingerprint = ''
+        key = (path, source_hash, algorithm, fingerprint)
         if key not in self._score_cache:
             self.lbl_info.setText('正在解析曲谱…')
-            if not self._score_loading:
+            self.lbl_midi_hint.setText('')
+            if not self._score_loading or self._score_request != key:
                 self._score_loading = True
-                threading.Thread(target=self._read_score, args=(key,), daemon=True).start()
+                self._score_request = key
+                threading.Thread(target=self._read_score, args=(key, options), daemon=True).start()
             return
         self._score_cache.move_to_end(key)
         score, error = self._score_cache[key]
         if error is not None:
             self.lbl_info.setText(f'无法解析：{error}')
+            self.lbl_midi_hint.setText('')
             return
         speed = self.slider_speed.value() / 100.0
         try:
@@ -739,36 +787,54 @@ class MainWindow(QMainWindow):
                 score.events, self.spin_transpose.value(), self.chk_auto_fit.isChecked(), speed=speed)
         except (ValueError, ArithmeticError) as exc:
             self.lbl_info.setText(f'无法解析：{exc}')
+            self.lbl_midi_hint.setText('')
             return
         self._plan = (score, notes, applied, dropped)
         parts = [f'可演奏 {len(notes)}/{len(score.events)} 音',
                  f'时长 {score.length / speed:.1f}s', f'移调 {applied:+d} 半音']
         if dropped:
             parts.append(f'过短跳过 {dropped}')
+        analysis = score.midi_analysis
+        if analysis is not None:
+            summary = self._midi_summary(analysis)
+            if summary:
+                parts.append(summary)
+            self.lbl_midi_hint.setText(self._midi_hint(analysis))
+            self._notify_midi_confidence(analysis)
+        else:
+            self.lbl_midi_hint.setText('')
         self.lbl_info.setText(' · '.join(parts))
 
-    def _read_score(self, key):
+    def _read_score(self, key, options):
         try:
-            score, error = load_score(key[0]), None
+            score, error = load_score(
+                key[0], midi_options=options, cache_dir=self._midi_cache_dir,
+                source_sha256=key[1],
+            ), None
         except Exception as exc:
             score, error = None, str(exc)
         if not self._closing:
             self._bridge.score_read.emit(key, score, error)
 
     def _on_score_read(self, key, score, error):
-        self._score_loading = False
         if self._closing:
             return
         self._score_cache[key] = (score, error)
+        self._score_cache.move_to_end(key)
         if len(self._score_cache) > 8:
             self._score_cache.popitem(last=False)
+        if key == self._score_request:
+            self._score_request = None
+            self._score_loading = False
+        if error is not None:
+            self._source_hashes.pop(key[0], None)
         self._update_info()
 
     def _song_preference_id(self, path: Path) -> str:
         source = 'git' if path.name in self._managed_scores else 'local'
         return f'{source}:{path.name}'
 
-    def _load_song_preferences(self) -> dict[str, dict[str, int]]:
+    def _load_song_preferences(self) -> dict[str, dict[str, object]]:
         raw = self._settings.value(_SONG_PREFERENCES_KEY, '')
         if not isinstance(raw, str) or not raw:
             return {}
@@ -781,19 +847,34 @@ class MainWindow(QMainWindow):
         songs = payload.get('songs')
         if not isinstance(songs, dict):
             return {}
-        preferences: dict[str, dict[str, int]] = {}
+        preferences: dict[str, dict[str, object]] = {}
         for song_id, values in songs.items():
             if not isinstance(song_id, str) or not isinstance(values, dict):
                 continue
-            transpose = values.get('transpose')
-            speed = values.get('speed_percent')
+            transpose = values.get('transpose', _DEFAULT_TRANSPOSE)
+            speed = values.get('speed_percent', _DEFAULT_SPEED_PERCENT)
             if (type(transpose) is not int
                     or not self.spin_transpose.minimum() <= transpose <= self.spin_transpose.maximum()):
-                continue
+                transpose = _DEFAULT_TRANSPOSE
             if (type(speed) is not int
                     or not self.slider_speed.minimum() <= speed <= self.slider_speed.maximum()):
-                continue
-            preferences[song_id] = {'transpose': transpose, 'speed_percent': speed}
+                speed = _DEFAULT_SPEED_PERCENT
+            entry: dict[str, object] = {'transpose': transpose, 'speed_percent': speed}
+            midi_values = values.get('midi_preprocess')
+            if isinstance(midi_values, dict):
+                source_hash = midi_values.get('source_sha256')
+                if isinstance(source_hash, str) and len(source_hash) == 64:
+                    try:
+                        options = MidiPreprocessOptions.from_dict(midi_values)
+                    except ValueError:
+                        pass
+                    else:
+                        entry['midi_preprocess'] = {
+                            **options.to_dict(),
+                            'source_sha256': source_hash,
+                            'track_name': str(midi_values.get('track_name', '')),
+                        }
+            preferences[song_id] = entry
         return preferences
 
     def _restore_song_preferences(self):
@@ -811,15 +892,83 @@ class MainWindow(QMainWindow):
         if path is None:
             return
         preferences = self._load_song_preferences()
-        preferences[self._song_preference_id(path)] = {
+        entry = preferences.setdefault(self._song_preference_id(path), {})
+        entry.update({
             'transpose': self.spin_transpose.value(),
             'speed_percent': self.slider_speed.value(),
-        }
+        })
+        self._write_song_preferences(preferences)
+
+    def _write_song_preferences(self, preferences: dict[str, dict[str, object]]):
         payload = {'version': 1, 'songs': preferences}
         self._settings.setValue(
             _SONG_PREFERENCES_KEY,
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
         )
+
+    def _midi_options_for(self, path: Path, source_hash: str) -> MidiPreprocessOptions:
+        preference = self._load_song_preferences().get(self._song_preference_id(path), {})
+        midi = preference.get('midi_preprocess')
+        if not isinstance(midi, dict) or midi.get('source_sha256') != source_hash:
+            return MidiPreprocessOptions()
+        return MidiPreprocessOptions.from_dict(midi)
+
+    def _save_midi_preference(self, options: MidiPreprocessOptions, source_hash: str, track_name: str = ''):
+        path = self._selected_path()
+        if path is None:
+            return
+        preferences = self._load_song_preferences()
+        entry = preferences.setdefault(self._song_preference_id(path), {
+            'transpose': self.spin_transpose.value(),
+            'speed_percent': self.slider_speed.value(),
+        })
+        entry['midi_preprocess'] = {
+            **options.to_dict(),
+            'source_sha256': source_hash,
+            'track_name': track_name,
+        }
+        self._write_song_preferences(preferences)
+
+    @staticmethod
+    def _midi_summary(analysis) -> str:
+        if analysis.selected is None:
+            return '旧版合并声部'
+        levels = {'high': '高', 'medium': '中', 'low': '低', 'manual': '手动'}
+        level = levels.get(analysis.confidence_level, '中')
+        selected = analysis.selected
+        parts = [f'声部 第{selected.track + 1}轨/通道{selected.channel + 1}']
+        if selected.track_name:
+            parts.append(selected.track_name)
+        parts.append(f'置信度{level}')
+        if analysis.repaired_short_notes:
+            parts.append(f'修复短音 {analysis.repaired_short_notes}')
+        if analysis.irreparable_short_notes:
+            parts.append(f'密集短音 {analysis.irreparable_short_notes}')
+        return ' · '.join(parts)
+
+    @staticmethod
+    def _midi_hint(analysis) -> str:
+        if analysis.confidence_level == 'legacy':
+            return '旧版模式会合并所有非打击乐声部；如声音杂乱，请改回自动识别或手动选声部。'
+        if analysis.confidence_level == 'low':
+            hint = '自动声部识别置信度较低，建议打开「MIDI 声部」确认旋律。'
+        elif analysis.confidence_level == 'medium':
+            hint = '已自动选择旋律候选，如有疑问可打开「MIDI 声部」调整。'
+        elif analysis.confidence_level == 'manual':
+            hint = '手动声部按当前文件内容保存；文件变化后会自动重新识别。'
+        else:
+            hint = ''
+        if analysis.irreparable_short_notes:
+            hint += f' 有 {analysis.irreparable_short_notes} 个短音因下一音过密无法延长。'
+        return hint.strip()
+
+    def _notify_midi_confidence(self, analysis):
+        if analysis.options.mode != 'auto' or analysis.confidence_level != 'low':
+            return
+        if analysis.source_sha256 in self._low_confidence_notified:
+            return
+        self._low_confidence_notified.add(analysis.source_sha256)
+        self._append_log(f'《{analysis.name}》自动声部识别置信度较低，可点击「MIDI 声部」手动确认')
 
     def _on_speed_changed(self, value: int):
         self.lbl_speed.setText(f'{value}%')
@@ -828,6 +977,125 @@ class MainWindow(QMainWindow):
 
     def _on_transpose_changed(self, _value: int):
         self._save_song_preferences()
+        self._update_info()
+
+    def _current_midi_analysis(self):
+        if self._plan is None:
+            return None
+        return self._plan[0].midi_analysis
+
+    def _open_midi_voices(self):
+        analysis = self._current_midi_analysis()
+        if analysis is None or self._closing or self._updating:
+            return
+        dialog = QDialog(self)
+        dialog.setObjectName('midiVoicesDialog')
+        dialog.setWindowTitle(f'MIDI 声部 · {analysis.name}')
+        dialog.resize(840, 430)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+        info = QLabel('')
+        info.setObjectName('hint')
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        table = QTableWidget(len(analysis.candidates), 8)
+        table.setObjectName('midiCandidateTable')
+        table.setHorizontalHeaderLabels(('轨道', '通道', '名称', '乐器', '音符', '音域', '最大复调', '评分'))
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        for row, candidate in enumerate(analysis.candidates):
+            values = (
+                str(candidate.track + 1), str(candidate.channel + 1),
+                candidate.track_name or '-', candidate.instrument, str(candidate.note_count),
+                f'{candidate.pitch_low}–{candidate.pitch_high}', str(candidate.max_polyphony),
+                f'{candidate.score:.1f}',
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column in (0, 1, 4, 6, 7):
+                    item.setTextAlignment(Qt.AlignCenter)
+                table.setItem(row, column, item)
+            if analysis.selected is not None and (
+                candidate.track == analysis.selected.track and candidate.channel == analysis.selected.channel
+            ):
+                table.selectRow(row)
+        if analysis.selected is None and analysis.candidates:
+            table.selectRow(0)
+        table.resizeColumnsToContents()
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table, 1)
+        levels = {'high': '高', 'medium': '中', 'low': '低', 'manual': '手动', 'legacy': '旧版'}
+        level = levels.get(analysis.confidence_level, '中')
+        if analysis.selected is None:
+            current = '旧版合并所有非打击乐声部'
+        else:
+            current = f'第{analysis.selected.track + 1}轨 / 通道{analysis.selected.channel + 1}'
+        info.setText(
+            f'当前：{current} · 置信度{level} {analysis.confidence:.0%} · '
+            f'候选分差 {analysis.score_margin:.1%}。轨道编号从 1 开始，通道 10 为打击乐并已排除。'
+        )
+        options_row = QHBoxLayout()
+        options_row.addWidget(QLabel('短音处理'))
+        strategy = QComboBox()
+        strategy.setObjectName('midiShortNoteStrategy')
+        strategy.addItem('自动修复可延长的短音', 'repair')
+        strategy.addItem('保留原始短音', 'keep')
+        strategy.setCurrentIndex(0 if analysis.options.short_note_strategy == 'repair' else 1)
+        options_row.addWidget(strategy)
+        options_row.addStretch(1)
+        layout.addLayout(options_row)
+        buttons = QHBoxLayout()
+        auto_button = QPushButton('恢复自动识别')
+        auto_button.setObjectName('midiAuto')
+        use_button = QPushButton('使用所选声部')
+        use_button.setObjectName('midiUseSelected')
+        legacy_button = QPushButton('旧版合并')
+        legacy_button.setObjectName('midiLegacy')
+        close_button = QPushButton('关闭')
+        close_button.setObjectName('midiClose')
+        for button in (auto_button, use_button, legacy_button, close_button):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+
+        def use_selected():
+            row = table.currentRow()
+            if not 0 <= row < len(analysis.candidates):
+                return
+            candidate = analysis.candidates[row]
+            options = MidiPreprocessOptions(
+                mode='manual', track=candidate.track, channel=candidate.channel,
+                short_note_strategy=strategy.currentData(),
+            )
+            self._apply_midi_options(options, candidate.track_name, dialog)
+
+        auto_button.clicked.connect(lambda: self._apply_midi_options(
+            MidiPreprocessOptions(mode='auto', short_note_strategy=strategy.currentData()), '', dialog,
+        ))
+        use_button.clicked.connect(use_selected)
+        legacy_button.clicked.connect(lambda: self._apply_midi_options(
+            MidiPreprocessOptions(mode='legacy', short_note_strategy=strategy.currentData()), '', dialog,
+        ))
+        close_button.clicked.connect(dialog.reject)
+        dialog.exec()
+
+    def _apply_midi_options(self, options: MidiPreprocessOptions, track_name: str = '', dialog=None):
+        analysis = self._current_midi_analysis()
+        if analysis is None:
+            if dialog is not None:
+                dialog.reject()
+            return
+        path = self._selected_path()
+        self._save_midi_preference(options, analysis.source_sha256, track_name)
+        self._low_confidence_notified.discard(analysis.source_sha256)
+        if path is not None:
+            for key in list(self._score_cache):
+                if key[0] == path:
+                    del self._score_cache[key]
+        mode_names = {'auto': '自动识别', 'manual': '手动声部', 'legacy': '旧版合并'}
+        self._append_log(f'《{analysis.name}》MIDI 处理已切换为{mode_names[options.mode]}')
+        if dialog is not None:
+            dialog.accept()
         self._update_info()
 
     def _add_score(self):
@@ -844,24 +1112,85 @@ class MainWindow(QMainWindow):
             self._append_log(f'无法创建曲库目录：{exc}')
             return
         selected = None
+        midi_paths: list[Path] = []
         for src in paths:
             if src.suffix.lower() not in _SCORE_SUFFIXES or not src.is_file():
                 continue
             dest = SCORES_DIR / src.name
+            created = False
             try:
                 if src.resolve() == dest.resolve():
                     selected = dest
-                    continue
-                if dest.exists():
-                    self._append_log(f'曲库中已存在同名文件：{dest.name}，未覆盖')
                 else:
-                    shutil.copy2(src, dest)
-                    self._append_log(f'已添加曲谱：{dest.name}')
-                selected = dest
+                    with src.open('rb') as source:
+                        try:
+                            target = dest.open('xb')
+                        except FileExistsError:
+                            self._append_log(f'曲库中已存在同名文件：{dest.name}，未覆盖')
+                            selected = dest
+                        else:
+                            created = True
+                            with target:
+                                shutil.copyfileobj(source, target)
+                    if created:
+                        shutil.copystat(src, dest)
+                        self._append_log(f'已添加曲谱：{dest.name}')
+                        selected = dest
+                if dest.suffix.lower() in ('.mid', '.midi'):
+                    midi_paths.append(dest)
             except OSError as exc:
+                if created:
+                    try:
+                        dest.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 self._append_log(f'添加曲谱失败：{exc}')
         if selected is not None:
             self._refresh_scores(selected)
+        self._queue_midi_preprocess(midi_paths)
+
+    def _queue_midi_preprocess(self, paths: list[Path]):
+        if not paths or self._closing:
+            return
+        for path in paths:
+            self._preprocess_queue.put(path)
+        if self._preprocess_worker is None or not self._preprocess_worker.is_alive():
+            self._preprocess_worker = threading.Thread(
+                target=self._preprocess_imported_scores, daemon=True,
+            )
+            self._preprocess_worker.start()
+
+    def _preprocess_imported_scores(self):
+        while True:
+            path = self._preprocess_queue.get()
+            try:
+                if path is None:
+                    return
+                if self._closing:
+                    continue
+                try:
+                    analysis = preprocess_midi(path, cache_dir=self._midi_cache_dir)
+                    error = None
+                except Exception as exc:
+                    analysis, error = None, str(exc)
+                if not self._closing:
+                    self._bridge.midi_preprocessed.emit(path, analysis, error)
+            finally:
+                self._preprocess_queue.task_done()
+
+    def _on_midi_preprocessed(self, path, analysis, error):
+        if self._closing:
+            return
+        for key in list(self._score_cache):
+            if key[0] == path:
+                del self._score_cache[key]
+        if error is not None:
+            self._append_log(f'MIDI 预处理失败：{path.name}：{error}')
+        else:
+            summary = self._midi_summary(analysis)
+            self._append_log(f'MIDI 预处理完成：{path.name} · {summary}')
+        if self._selected_path() == path:
+            self._update_info()
 
     def dragEnterEvent(self, event):
         if not self._closing and not self._updating and self._state not in _ACTIVE_STATES:
@@ -985,6 +1314,7 @@ class MainWindow(QMainWindow):
                        self.chk_foreground, self.edit_process):
             widget.setEnabled(configurable)
         self.chk_dry.setEnabled(configurable and sys.platform == 'win32')
+        self.btn_midi.setEnabled(configurable and self._current_midi_analysis() is not None)
         self.btn_mini.setEnabled(not self._closing and not self._updating)
         self.slider_mini_opacity.setEnabled(not self._closing)
         self._update_mini()
@@ -1072,6 +1402,7 @@ class MainWindow(QMainWindow):
             return
         self._save_mini_position()
         self._mini.hide()
+        self._preprocess_queue.put(None)
         self._settings.sync()
         self._hotkeys.stop()
         super().closeEvent(event)

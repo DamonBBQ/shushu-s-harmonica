@@ -5,11 +5,15 @@ from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
 
-import mido
+from .midi_preprocess import (
+    MidiAnalysisResult,
+    MidiNoteEvent,
+    MidiPreprocessOptions,
+    preprocess_midi,
+)
 
 _NOTE_OFFSETS = (0, 2, 4, 5, 7, 9, 11)
 _TXT_TOKEN = re.compile(r'([b#^]*)([0-8i])(-*)', re.IGNORECASE)
-_CHORD_WINDOW = 0.03
 
 
 @dataclass
@@ -26,81 +30,55 @@ class Score:
     name: str
     events: list[ScoreEvent]
     length: float
+    source_sha256: str | None = None
+    midi_analysis: MidiAnalysisResult | None = field(default=None, repr=False, compare=False)
 
 
-def load_score(path: str | Path) -> Score:
+def load_score(
+    path: str | Path,
+    *,
+    midi_options: MidiPreprocessOptions | None = None,
+    cache_dir: str | Path | None = None,
+    source_sha256: str | None = None,
+) -> Score:
     path = Path(path)
     if path.suffix.lower() in ('.mid', '.midi'):
-        return load_midi(path)
-    return load_txt(path)
+        return load_midi(
+            path, options=midi_options, cache_dir=cache_dir, source_sha256=source_sha256,
+        )
+    score = load_txt(path)
+    score.source_sha256 = source_sha256
+    return score
 
 
-def load_midi(path: str | Path) -> Score:
+def load_midi(
+    path: str | Path,
+    *,
+    options: MidiPreprocessOptions | None = None,
+    cache_dir: str | Path | None = None,
+    source_sha256: str | None = None,
+) -> Score:
     path = Path(path)
-    mid = mido.MidiFile(str(path))
-    if mid.type == 2:
-        raise ValueError('不支持 type 2（异步多轨）MIDI 文件')
-    if mid.ticks_per_beat <= 0:
-        raise ValueError('不支持使用 SMPTE 时间基准的 MIDI 文件')
-
-    # 共享 tempo 时间轴，同时保留轨道编号，避免跨轨配对同频道的同音高。
-    timeline = []
-    end_tick = 0
-    for track_index, track in enumerate(mid.tracks):
-        tick = 0
-        for msg in track:
-            tick += msg.time
-            if msg.type == 'set_tempo' or (
-                msg.type in ('note_on', 'note_off') and msg.channel != 9
-            ):
-                timeline.append((tick, track_index, msg))
-        end_tick = max(end_tick, tick)
-    timeline.sort(key=lambda item: item[0])
-
-    active: dict[tuple[int, int, int], tuple[float, int]] = {}
-    raw: list[ScoreEvent] = []
-    tempo = 500_000
-    previous_tick = 0
-    now = 0.0
-
-    for tick, track_index, msg in timeline:
-        now += mido.tick2second(tick - previous_tick, mid.ticks_per_beat, tempo)
-        previous_tick = tick
-        if msg.type == 'set_tempo':
-            tempo = msg.tempo
-            continue
-        key = (track_index, msg.channel, msg.note)
-        previous_note = active.pop(key, None)
-        if previous_note is not None:
-            start, velocity = previous_note
-            raw.append(ScoreEvent(msg.note, start, now - start, velocity))
-        if msg.type == 'note_on' and msg.velocity > 0:
-            active[key] = (now, msg.velocity)
-
-    for (_, _, note), (start, velocity) in active.items():
-        raw.append(ScoreEvent(note, start, 0.5, velocity))
-
-    if not raw:
-        raise ValueError('MIDI 中没有可用音符（已忽略打击乐通道）')
-
-    track_end = now + mido.tick2second(end_tick - previous_tick, mid.ticks_per_beat, tempo)
-    length = max(track_end, max(event.start + event.duration for event in raw))
-    return Score(name=path.stem, events=_group_chords(raw), length=length)
+    analysis = preprocess_midi(
+        path, options, cache_dir=cache_dir, source_sha256=source_sha256,
+    )
+    return Score(
+        name=path.stem,
+        events=[_to_score_event(event) for event in analysis.events],
+        length=analysis.length,
+        source_sha256=analysis.source_sha256,
+        midi_analysis=analysis,
+    )
 
 
-def _group_chords(events: list[ScoreEvent]) -> list[ScoreEvent]:
-    events.sort(key=lambda event: event.start)
-    groups: list[ScoreEvent] = []
-    first = 0
-    while first < len(events):
-        end = first + 1
-        while end < len(events) and events[end].start - events[first].start < _CHORD_WINDOW:
-            end += 1
-        primary, *alternatives = sorted(events[first:end], key=lambda event: -event.pitch)
-        primary.alternatives = tuple(alternatives)
-        groups.append(primary)
-        first = end
-    return groups
+def _to_score_event(event: MidiNoteEvent) -> ScoreEvent:
+    return ScoreEvent(
+        pitch=event.pitch,
+        start=event.start,
+        duration=event.duration,
+        velocity=event.velocity,
+        alternatives=tuple(_to_score_event(item) for item in event.alternatives),
+    )
 
 
 def load_txt(path: str | Path) -> Score:

@@ -9,6 +9,7 @@ from urllib.error import URLError
 import mido
 
 from core.mapping import build_play_notes, to_action
+from core.midi_preprocess import MidiPreprocessOptions
 from core.score import ScoreEvent, load_midi, load_score, load_txt
 from core.updater import RemoteScore, ScoreUpdater, UpdateError, git_blob_sha
 
@@ -81,7 +82,9 @@ class ScoreTests(unittest.TestCase):
         second.append(mido.Message('note_on', channel=0, note=60, time=160))
         second.append(mido.Message('note_on', channel=0, note=60, velocity=0, time=320))
 
-        score = self.load_midi_file(midi)
+        path = self.directory / 'example.mid'
+        midi.save(path)
+        score = load_midi(path, options=MidiPreprocessOptions(mode='legacy'))
         self.assertEqual(len(score.events), 2)
         self.assertAlmostEqual(score.events[0].duration, 0.14)
         self.assertAlmostEqual(score.events[1].start, 0.08)
@@ -101,7 +104,9 @@ class ScoreTests(unittest.TestCase):
             mido.Message('note_off', note=72, time=100),
             mido.Message('note_off', note=60, time=500),
         ))
-        score = self.load_midi_file(midi)
+        path = self.directory / 'example.mid'
+        midi.save(path)
+        score = load_midi(path, options=MidiPreprocessOptions(mode='legacy'))
         for speed, pitch in ((1.0, 60), (0.5, 72)):
             with self.subTest(speed=speed):
                 notes, _, dropped = build_play_notes(score.events, speed=speed)
